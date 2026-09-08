@@ -12,7 +12,7 @@ HT_TELEMETRY_CSV = DATA_DIR / "242000_tags.csv"
 
 LIMS_XLSX = ROOT / "lims_export_2023.xlsx"
 PAK_XLSX = ROOT / "pak_export_2023.xlsx"
-TAGS_XLSX = ROOT / "tags_hackathon.xlsx"
+TAGS_XLSX = ROOT / "docs/tz/tags_hackathon.xlsx"
 
 LONG_FORMAT_CSV = BUILD_DIR / "lims_pak_long.csv"
 TAG_MAP_CSV = BUILD_DIR / "tag_map.csv"

@@ -52,10 +52,10 @@ pytest -q
 
 | Файл | Описание |
 |---|---|
-| `tz_neftekod.docx` / `tz_neftekod.md` | Техническое задание для участников (md — версия, удобная для чтения нейросетью). |
-| `tags_hackathon.xlsx` / `tags_hackathon.md` | Справочник тегов: листы КИП, ЛА, ПАК, ВАК. |
-| `avt_schemas.pdf` / `avt_schemas.md` | Технологические схемы АВТ (md ссылается на изображения страниц в `assets/`). |
-| `assets/` | PNG-рендеры страниц `avt_schemas.pdf`, используются в `avt_schemas.md`. |
+| `docs/tz/tz_neftekod.docx` / `docs/tz/tz_neftekod.md` | Техническое задание для участников (md — версия, удобная для чтения нейросетью). |
+| `docs/tz/tags_hackathon.xlsx` / `docs/tz/tags_hackathon.md` | Справочник тегов: листы КИП, ЛА, ПАК, ВАК. |
+| `docs/tz/avt_schemas.pdf` / `docs/tz/avt_schemas.md` | Технологические схемы АВТ (md ссылается на изображения страниц в `assets/`). |
+| `assets/` | PNG-рендеры страниц `docs/tz/avt_schemas.pdf`, используются в `docs/tz/avt_schemas.md`. |
 | `pak_export_2023.xlsx` | Данные поточных анализаторов (ПАК). Исходное имя: «Выгрузка ПАК 01.01.2023 - н.в_.xlsx». |
 | `lims_export_2023.xlsx` | Лабораторные результаты (ЛИМС). Исходное имя: «ЛИМСы 01.01.2023 - н.в_ (2).xlsx». |
 
@@ -68,4 +68,4 @@ pytest -q
 
 Скачать их можно по ссылке: https://drive.google.com/drive/folders/1nH7mdXxdGIvv8Rp6g170xSrUggMfpN4L?usp=sharing
 
-Описание содержимого и правила синхронизации данных — в `tz_neftekod.md`, раздел «2. Данные, которые получает команда».
+Описание содержимого и правила синхронизации данных — в `docs/tz/tz_neftekod.md`, раздел «2. Данные, которые получает команда».
