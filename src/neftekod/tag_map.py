@@ -231,6 +231,25 @@ def tags_without_unit(tag_map: pd.DataFrame) -> pd.DataFrame:
     return tag_map[tag_map["unit"].isna()].reset_index(drop=True)
 
 
+def duplicate_descriptions(tag_map: pd.DataFrame) -> pd.DataFrame:
+    """Коды листа «КИП», у которых внутри установки совпадает описание.
+
+    Один поток — одно описание: два разных кода с дословно одинаковым текстом
+    означают, что описание не определяет колонку однозначно. На данных такие
+    пары расходятся (см. ADR-007), поэтому это не косметика справочника.
+
+        installation | description | codes
+    """
+    kip = tag_map[tag_map["source_sheet"] == "КИП"]
+    grouped = (
+        kip.groupby(["installation", "description"])["code"]
+        .apply(lambda codes: sorted(code.split(":", 1)[1] for code in codes))
+        .reset_index(name="codes")
+    )
+    duplicates = grouped[grouped["codes"].str.len() > 1]
+    return duplicates.sort_values(["installation", "description"]).reset_index(drop=True)
+
+
 if __name__ == "__main__":
     frame = build_tag_map()
     config.BUILD_DIR.mkdir(exist_ok=True)

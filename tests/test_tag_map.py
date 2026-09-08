@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from neftekod import parse_lims_pak, tag_map
+from neftekod import config, parse_lims_pak, tag_map
 
 
 def test_no_record_lost_from_source_sheets():
@@ -50,6 +50,46 @@ def test_blocked_formulas_carry_adr_reference():
     pipeline = vak[vak["description"].str.contains("Pipeline")]
     assert set(pipeline["code"]) == {"24-2000:GODT:D15", "24-2000:GODT:T95"}
     assert pipeline["notes"].str.contains("ADR-003").all()
+
+
+def test_duplicate_descriptions_are_reported():
+    """Коды с одинаковым описанием находятся, а не теряются в справочнике."""
+    duplicates = tag_map.duplicate_descriptions(tag_map.build_tag_map())
+    found = {
+        (row.installation, tuple(row.codes)) for row in duplicates.itertuples()
+    }
+    assert found == {
+        ("24-2000", ("F1", "T12")),
+        ("24-2000", ("F17", "T23")),
+        ("АВТ", ("F56", "F57")),
+        ("АВТ", ("F68", "F69")),
+    }
+
+
+def test_duplicate_description_pairs_disagree_in_telemetry():
+    """Одно описание — один поток. Три пары из четырёх этому не отвечают.
+
+    Дефект — не дублирующееся описание само по себе (`F56`/`F57` при
+    corr +0.997 действительно один поток с двух приборов), а расхождение
+    рядов под общим описанием. См. ADR-007.
+    """
+    telemetry = {
+        "24-2000": pd.read_csv(config.HT_TELEMETRY_CSV),
+        "АВТ": pd.read_csv(config.AVT_TELEMETRY_CSV),
+    }
+    duplicates = tag_map.duplicate_descriptions(tag_map.build_tag_map())
+    correlations = {}
+    for row in duplicates.itertuples():
+        frame = telemetry[row.installation]
+        first, second = row.codes
+        correlations[(row.installation, first, second)] = frame[first].corr(frame[second])
+
+    agreeing = {key for key, value in correlations.items() if value > 0.95}
+    assert agreeing == {("АВТ", "F56", "F57")}
+    # Остальные три пары расходятся настолько, что общее описание не может
+    # относиться к обоим тегам — вопрос к организаторам, ADR-007.
+    for key in set(correlations) - agreeing:
+        assert correlations[key] < 0.7
 
 
 def test_la_sheet_has_no_machine_codes():
