@@ -99,6 +99,22 @@ def test_unit_conflicts_are_reported_not_fixed(lims_long):
     }
 
 
+def test_sulfur_unit_difference_is_surfaced(lims_long, pak_long):
+    """Сера объявлена как «ppm» в ПАК и «мг/кг» в ЛИМС — см. ADR-005.
+
+    Величина одна и та же (1 ppm = 1 мг/кг для массовой доли), но это
+    конвертация, а не совпадение имён: она касается жёсткой проверки
+    «сера ≤ 10 мг/кг» и не должна применяться молча.
+    """
+    frame = pd.concat([lims_long, pak_long], ignore_index=True)
+    conflicts = parse_lims_pak.unit_conflicts(frame)
+    sulfur = conflicts[conflicts["indicator"] == "Mg.Sulfur"]
+    assert dict(zip(sulfur["tag"], sulfur["unit_declared"])) == {
+        "24-2000:Mg.Sulfur": "ppm",
+        "LIMS:Гидроочистка.2.Mg.Sulfur": "мг/кг",
+    }
+
+
 @pytest.mark.parametrize("column", parse_lims_pak.LONG_COLUMNS)
 def test_long_format_columns(lims_long, column):
     assert column in lims_long.columns
