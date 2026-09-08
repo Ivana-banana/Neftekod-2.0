@@ -11,7 +11,15 @@ if [ ! -f "$TEST_FILE" ]; then
   exit 0
 fi
 
-OUTPUT="$(pytest "$TEST_FILE" -q 2>&1)"
+# Окружение проекта, а не системный pytest: тест импортирует пакет neftekod,
+# который ставится в .venv (`pip install -e ".[dev]"`, см. README).
+if [ -x ".venv/bin/pytest" ]; then
+  PYTEST=".venv/bin/pytest"
+else
+  PYTEST="pytest"
+fi
+
+OUTPUT="$($PYTEST "$TEST_FILE" -q 2>&1)"
 STATUS=$?
 
 if [ "$STATUS" -ne 0 ]; then
