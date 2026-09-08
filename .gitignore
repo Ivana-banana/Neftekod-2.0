@@ -1,3 +1,10 @@
 # Крупные телеметрические данные не хранятся в git (см. README — ссылка на Google Drive)
 data/avt_tags.csv
 data/242000_tags.csv
+
+# Окружение и артефакты сборки
+.venv/
+build/
+__pycache__/
+*.egg-info/
+.pytest_cache/
