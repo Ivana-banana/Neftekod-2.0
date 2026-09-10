@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from . import config, splits
+from . import config, features, splits
 
 TARGET_TAG = "LIMS:Гидроочистка.2.Mg.Sulfur"
 PAK_SULFUR_TAG = "24-2000:Mg.Sulfur"
@@ -24,7 +24,13 @@ FEATURE_NAMES = (
     "pak_age_hours",
     "pak_missing",
 )
+TELEMETRY_FEATURE_NAMES = tuple(
+    name
+    for tag in features.TELEMETRY_TAGS
+    for name in (f"{tag}_value", f"{tag}_age_hours", f"{tag}_missing")
+)
 DEFAULT_ALPHAS = (0.0, 0.01, 0.1, 1.0, 10.0, 100.0)
+DEFAULT_TELEMETRY_LAGS = (0.0, 1.0, 2.0, 3.0)
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,8 @@ def build_prediction_frame(
     *,
     target_tag: str = TARGET_TAG,
     pak_tag: str = PAK_SULFUR_TAG,
+    telemetry: pd.DataFrame | None = None,
+    telemetry_lag_hours: float = 0.0,
 ) -> pd.DataFrame:
     """Сформировать строки target / признаки as-of для заданного горизонта.
 
@@ -93,16 +101,27 @@ def build_prediction_frame(
     pak = _indexed_observations(frame, pak_tag)
     rows: list[dict] = []
     horizon = pd.Timedelta(hours=float(horizon_hours))
-    for _, target in targets.frame.iterrows():
+    synchronized = None
+    if telemetry is not None:
+        issue_times = [target["timestamp"] - horizon for _, target in targets.frame.iterrows()]
+        synchronized = features.synchronize_features(
+            issue_times,
+            frame,
+            telemetry,
+            telemetry_lag_hours=telemetry_lag_hours,
+            target_tag=target_tag,
+            pak_tag=pak_tag,
+        )
+    for target_position, (_, target) in enumerate(targets.frame.iterrows()):
         target_time = target["timestamp"]
         issue_time = target_time - horizon
-        baseline = _latest(targets, issue_time)
-        # См. ADR-008: без предыдущего доступного анализа persistence не определён.
-        if baseline is None:
-            continue
-        pak_value = _latest(pak, issue_time)
-        rows.append(
-            {
+        if synchronized is None:
+            baseline = _latest(targets, issue_time)
+            # См. ADR-008: без предыдущего доступного анализа persistence не определён.
+            if baseline is None:
+                continue
+            pak_value = _latest(pak, issue_time)
+            row = {
                 "target_time": target_time,
                 "issue_time": issue_time,
                 "target_value": float(target["value"]),
@@ -119,7 +138,30 @@ def build_prediction_frame(
                 else (issue_time - pak_value[1]).total_seconds() / 3600.0,
                 "pak_missing": pak_value is None,
             }
-        )
+        else:
+            synchronized_row = synchronized.iloc[target_position]
+            # См. ADR-008: без предыдущего доступного анализа persistence не определён.
+            if bool(synchronized_row["lims_missing"]):
+                continue
+            row = {
+                "target_time": target_time,
+                "issue_time": issue_time,
+                "target_value": float(target["value"]),
+                "target_available_at": target["available_at"],
+                "baseline_prediction": synchronized_row["lims_value"],
+                "baseline_timestamp": synchronized_row["lims_timestamp"],
+                "baseline_available_at": synchronized_row["lims_available_at"],
+                "baseline_age_hours": synchronized_row["lims_age_hours"],
+                "pak_value": synchronized_row["pak_value"],
+                "pak_timestamp": synchronized_row["pak_timestamp"],
+                "pak_available_at": synchronized_row["pak_available_at"],
+                "pak_age_hours": synchronized_row["pak_age_hours"],
+                "pak_missing": synchronized_row["pak_missing"],
+            }
+            for tag in features.TELEMETRY_TAGS:
+                for suffix in ("value", "timestamp", "age_hours", "missing"):
+                    row[f"{tag}_{suffix}"] = synchronized_row[f"{tag}_{suffix}"]
+        rows.append(row)
     result = pd.DataFrame(rows)
     if result.empty:
         return pd.DataFrame(
@@ -129,6 +171,7 @@ def build_prediction_frame(
                 "target_value",
                 "target_available_at",
                 *FEATURE_NAMES,
+                *TELEMETRY_FEATURE_NAMES,
             ]
         )
     return result.sort_values("target_time", kind="mergesort").reset_index(drop=True)
@@ -156,11 +199,37 @@ def score_predictions(actual: pd.Series, predicted: pd.Series) -> dict[str, floa
     }
 
 
-def _features(frame: pd.DataFrame) -> np.ndarray:
-    values = frame.loc[:, FEATURE_NAMES].copy()
+def _feature_names(frame: pd.DataFrame) -> tuple[str, ...]:
+    if all(column in frame.columns for column in TELEMETRY_FEATURE_NAMES):
+        return FEATURE_NAMES + TELEMETRY_FEATURE_NAMES
+    return FEATURE_NAMES
+
+
+def _feature_values(
+    frame: pd.DataFrame,
+    feature_names: tuple[str, ...],
+    imputation_values: np.ndarray | None = None,
+) -> pd.DataFrame:
+    values = frame.loc[:, feature_names].copy()
     values["pak_value"] = values["pak_value"].fillna(values["baseline_prediction"])
     values["pak_age_hours"] = values["pak_age_hours"].fillna(values["baseline_age_hours"])
-    values["pak_missing"] = values["pak_missing"].astype(float)
+    for column in feature_names:
+        numeric = pd.to_numeric(values[column], errors="coerce")
+        values[column] = numeric.where(np.isfinite(numeric), np.nan)
+    values["pak_missing"] = values["pak_missing"].fillna(True).astype(float)
+    if imputation_values is not None:
+        fill_values = pd.Series(imputation_values, index=feature_names)
+        values = values.fillna(fill_values)
+    return values
+
+
+def _features(
+    frame: pd.DataFrame,
+    feature_names: tuple[str, ...] | None = None,
+    imputation_values: np.ndarray | None = None,
+) -> np.ndarray:
+    names = feature_names or _feature_names(frame)
+    values = _feature_values(frame, names, imputation_values)
     matrix = values.to_numpy(dtype=float)
     if not np.isfinite(matrix).all():
         raise ValueError("признаки содержат нечисловые значения")
@@ -172,6 +241,8 @@ class RidgeModel:
     means: np.ndarray
     scales: np.ndarray
     coefficients: np.ndarray
+    feature_names: tuple[str, ...] = FEATURE_NAMES
+    imputation_values: np.ndarray | None = None
 
 
 def fit_ridge(frame: pd.DataFrame, alpha: float = 1.0) -> RidgeModel:
@@ -180,8 +251,18 @@ def fit_ridge(frame: pd.DataFrame, alpha: float = 1.0) -> RidgeModel:
         raise ValueError("alpha не может быть отрицательным")
     if len(frame) < 2:
         raise ValueError("для обучения нужно минимум две строки")
-    x = _features(frame)
+    # См. ADR-009: единицы/масштабы P8, T11 и F19 не подтверждены, поэтому
+    # телеметрия используется как числовой сигнал и стандартизируется на fit.
+    feature_names = _feature_names(frame)
+    raw_values = _feature_values(frame, feature_names)
+    imputation_values = raw_values.median(axis=0, skipna=True).to_numpy(
+        dtype=float, copy=True
+    )
+    imputation_values[~np.isfinite(imputation_values)] = 0.0
+    x = _features(frame, feature_names, imputation_values)
     y = frame["target_value"].to_numpy(dtype=float)
+    if not np.isfinite(y).all():
+        raise ValueError("цель содержит нечисловые значения")
     means = x.mean(axis=0)
     scales = x.std(axis=0)
     scales[scales == 0] = 1.0
@@ -195,11 +276,13 @@ def fit_ridge(frame: pd.DataFrame, alpha: float = 1.0) -> RidgeModel:
     augmented_design = np.vstack([design, penalty])
     augmented_target = np.concatenate([y, np.zeros(len(penalty))])
     coefficients = np.linalg.lstsq(augmented_design, augmented_target, rcond=None)[0]
-    return RidgeModel(means, scales, coefficients)
+    return RidgeModel(means, scales, coefficients, feature_names, imputation_values)
 
 
 def predict_ridge(model: RidgeModel, frame: pd.DataFrame) -> np.ndarray:
-    x = (_features(frame) - model.means) / model.scales
+    x = (
+        _features(frame, model.feature_names, model.imputation_values) - model.means
+    ) / model.scales
     return np.column_stack([np.ones(len(x)), x]) @ model.coefficients
 
 
@@ -224,33 +307,69 @@ def _metric_row(
     rows: pd.DataFrame,
     predicted,
     alpha: float | None = None,
+    telemetry_lag_hours: float | None = None,
+    selected: bool | None = None,
 ) -> dict:
     metrics = score_predictions(rows["target_value"], predicted)
+    telemetry_ages = {
+        f"{tag}_age_hours_median": (
+            float(rows[f"{tag}_age_hours"].median()) if f"{tag}_age_hours" in rows else np.nan
+        )
+        for tag in features.TELEMETRY_TAGS
+    }
+    telemetry_missing = {
+        f"{tag}_missing_fraction": (
+            float(rows[f"{tag}_missing"].mean()) if f"{tag}_missing" in rows else np.nan
+        )
+        for tag in features.TELEMETRY_TAGS
+    }
     return {
         "horizon_hours": horizon,
         "split": split_name,
         "model": model_name,
         "alpha": alpha,
+        "telemetry_lag_hours": telemetry_lag_hours,
+        "selected": selected,
         "evidence_type": "backtested",
         **metrics,
+        "lims_age_hours_median": float(rows["baseline_age_hours"].median()),
         "baseline_age_hours_median": float(rows["baseline_age_hours"].median()),
+        "pak_age_hours_median": float(rows["pak_age_hours"].median()),
         "pak_missing_fraction": float(rows["pak_missing"].mean()),
+        **telemetry_ages,
+        **telemetry_missing,
     }
 
 
-def evaluate_forecasts(
+REPORT_COLUMNS = [
+    "horizon_hours",
+    "split",
+    "model",
+    "alpha",
+    "telemetry_lag_hours",
+    "selected",
+    "evidence_type",
+    "n",
+    "mae",
+    "rmse",
+    "r2",
+    "lims_age_hours_median",
+    "baseline_age_hours_median",
+    "pak_age_hours_median",
+    "pak_missing_fraction",
+    *(f"{tag}_age_hours_median" for tag in features.TELEMETRY_TAGS),
+    *(f"{tag}_missing_fraction" for tag in features.TELEMETRY_TAGS),
+]
+
+
+def _evaluate_without_telemetry(
     frame: pd.DataFrame,
     horizons: tuple[float, ...] = (0, 1, 2, 3),
     *,
     target_tag: str = TARGET_TAG,
     pak_tag: str = PAK_SULFUR_TAG,
     alphas: tuple[float, ...] = DEFAULT_ALPHAS,
-) -> pd.DataFrame:
-    """Оценить persistence и Ridge на fit/valid/test по каждому горизонту."""
-    if not horizons:
-        raise ValueError("нужно задать хотя бы один горизонт")
-    if not alphas or any(alpha < 0 for alpha in alphas):
-        raise ValueError("список alpha пуст или содержит отрицательное значение")
+) -> list[dict]:
     report: list[dict] = []
     for horizon in horizons:
         supervised = build_prediction_frame(
@@ -314,17 +433,161 @@ def evaluate_forecasts(
                     alpha=selected_alpha,
                 )
             )
-    columns = [
-        "horizon_hours",
-        "split",
-        "model",
-        "alpha",
-        "evidence_type",
-        "n",
-        "mae",
-        "rmse",
-        "r2",
-        "baseline_age_hours_median",
-        "pak_missing_fraction",
-    ]
-    return pd.DataFrame(report, columns=columns)
+    return report
+
+
+def _normalise_lags(telemetry_lags) -> tuple[float, ...]:
+    if not telemetry_lags:
+        raise ValueError("список лагов телеметрии пуст")
+    lags = tuple(float(lag) for lag in telemetry_lags)
+    if any(not np.isfinite(lag) or lag < 0 for lag in lags):
+        raise ValueError("лаг телеметрии должен быть конечным и неотрицательным")
+    return tuple(sorted(set(lags)))
+
+
+def _evaluate_with_telemetry(
+    frame: pd.DataFrame,
+    telemetry: pd.DataFrame,
+    horizons: tuple[float, ...],
+    target_tag: str,
+    pak_tag: str,
+    alphas: tuple[float, ...],
+    telemetry_lags: tuple[float, ...],
+) -> list[dict]:
+    """Оценить телеметрию; test получает только lag, выбранный на valid."""
+    report: list[dict] = []
+    for horizon in horizons:
+        by_lag = {
+            lag: _split_rows(
+                build_prediction_frame(
+                    frame,
+                    horizon,
+                    target_tag=target_tag,
+                    pak_tag=pak_tag,
+                    telemetry=telemetry,
+                    telemetry_lag_hours=lag,
+                )
+            )
+            for lag in telemetry_lags
+        }
+        baseline_parts = by_lag[telemetry_lags[0]]
+        for split_name, rows in baseline_parts.items():
+            if rows.empty:
+                continue
+            report.append(
+                _metric_row(
+                    horizon=horizon,
+                    split_name=split_name,
+                    model_name="persistence",
+                    rows=rows,
+                    predicted=rows["baseline_prediction"],
+                )
+            )
+
+        candidates = []
+        for lag in telemetry_lags:
+            parts = by_lag[lag]
+            fit_rows = parts["fit"]
+            if len(fit_rows) < 2:
+                continue
+            models = {alpha: fit_ridge(fit_rows, alpha) for alpha in alphas}
+            if parts["valid"].empty:
+                selected_alpha = alphas[0]
+                valid_rmse = float("inf")
+            else:
+                scores = {
+                    alpha: score_predictions(
+                        parts["valid"]["target_value"],
+                        predict_ridge(model, parts["valid"]),
+                    )["rmse"]
+                    for alpha, model in models.items()
+                }
+                selected_alpha = min(scores, key=lambda alpha: (scores[alpha], alpha))
+                valid_rmse = scores[selected_alpha]
+            candidates.append((valid_rmse, lag, selected_alpha, models[selected_alpha]))
+
+        if not candidates:
+            continue
+        # См. ADR-009: lag выбирается только по fit/valid, test здесь не участвует.
+        _, selected_lag, selected_alpha, _ = min(
+            candidates, key=lambda item: (item[0], item[1], item[2])
+        )
+        for _, lag, alpha, fit_model in candidates:
+            parts = by_lag[lag]
+            for split_name in ("fit", "valid"):
+                rows = parts[split_name]
+                if rows.empty:
+                    continue
+                report.append(
+                    _metric_row(
+                        horizon=horizon,
+                        split_name=split_name,
+                        model_name="ridge_telemetry",
+                        rows=rows,
+                        predicted=predict_ridge(fit_model, rows),
+                        alpha=alpha,
+                        telemetry_lag_hours=lag,
+                        selected=lag == selected_lag,
+                    )
+                )
+
+        selected_parts = by_lag[selected_lag]
+        if not selected_parts["test"].empty:
+            final_train = pd.concat(
+                [selected_parts["fit"], selected_parts["valid"]], ignore_index=True
+            )
+            final_model = fit_ridge(final_train, selected_alpha)
+            report.append(
+                _metric_row(
+                    horizon=horizon,
+                    split_name="test",
+                    model_name="ridge_telemetry",
+                    rows=selected_parts["test"],
+                    predicted=predict_ridge(final_model, selected_parts["test"]),
+                    alpha=selected_alpha,
+                    telemetry_lag_hours=selected_lag,
+                    selected=True,
+                )
+            )
+    return report
+
+
+def evaluate_forecasts(
+    frame: pd.DataFrame,
+    horizons: tuple[float, ...] = (0, 1, 2, 3),
+    *,
+    target_tag: str = TARGET_TAG,
+    pak_tag: str = PAK_SULFUR_TAG,
+    alphas: tuple[float, ...] = DEFAULT_ALPHAS,
+    telemetry: pd.DataFrame | None = None,
+    telemetry_lags: tuple[float, ...] = DEFAULT_TELEMETRY_LAGS,
+) -> pd.DataFrame:
+    """Оценить persistence и Ridge по fit/valid/test.
+
+    Если передана телеметрия, lag и alpha выбираются на fit/valid, а test
+    оценивает только выбранную комбинацию. Без телеметрии сохраняется
+    существующий baseline-режим для обратной совместимости.
+    """
+    if not horizons:
+        raise ValueError("нужно задать хотя бы один горизонт")
+    if not alphas or any(alpha < 0 for alpha in alphas):
+        raise ValueError("список alpha пуст или содержит отрицательное значение")
+    if telemetry is None:
+        report = _evaluate_without_telemetry(
+            frame,
+            horizons,
+            target_tag=target_tag,
+            pak_tag=pak_tag,
+            alphas=alphas,
+        )
+    else:
+        report = _evaluate_with_telemetry(
+            frame,
+            telemetry,
+            horizons,
+            target_tag,
+            pak_tag,
+            alphas,
+            _normalise_lags(telemetry_lags),
+        )
+    return pd.DataFrame(report, columns=REPORT_COLUMNS)

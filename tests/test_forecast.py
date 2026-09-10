@@ -92,6 +92,27 @@ def test_prediction_frame_ignores_non_finite_observations():
     assert prediction.iloc[0]["pak_value"] == pytest.approx(8.5)
 
 
+def test_prediction_frame_adds_asof_telemetry_features():
+    rows = _observations()
+    telemetry = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2025-01-01 07:50", "2025-01-01 09:10"]),
+            "P8": [1.0, 2.0],
+            "T11": [10.0, 20.0],
+            "F19": [100.0, 200.0],
+        }
+    )
+
+    prediction = forecast.build_prediction_frame(rows, horizon_hours=1, telemetry=telemetry)
+
+    row = prediction.iloc[0]
+    assert row["issue_time"] == pd.Timestamp("2025-01-01 09:00")
+    assert row["P8_value"] == pytest.approx(1.0)
+    assert row["T11_value"] == pytest.approx(10.0)
+    assert row["F19_value"] == pytest.approx(100.0)
+    assert row["P8_age_hours"] == pytest.approx(1 + 10 / 60)
+
+
 def test_evaluate_forecasts_labels_backtest_and_keeps_train_valid_test_separate():
     rows = []
     for index, day in enumerate(pd.date_range("2023-01-01", "2026-01-10", freq="7D")):
@@ -121,3 +142,50 @@ def test_evaluate_forecasts_labels_backtest_and_keeps_train_valid_test_separate(
     assert set(report["evidence_type"]) == {"backtested"}
     assert set(report["horizon_hours"]) == {0, 1}
     assert (report["n"] > 0).all()
+
+
+def test_telemetry_evaluation_reports_all_candidate_lags_but_scores_one_on_test():
+    rows = []
+    days = pd.date_range("2023-01-01", "2026-01-10", freq="7D")
+    for index, day in enumerate(days):
+        value = 7.0 + index * 0.01
+        rows.extend(
+            [
+                {
+                    "timestamp": day,
+                    "available_at": day + pd.Timedelta(hours=4),
+                    "source": "lims",
+                    "tag": "LIMS:Гидроочистка.2.Mg.Sulfur",
+                    "value": value,
+                },
+                {
+                    "timestamp": day,
+                    "available_at": day,
+                    "source": "pak",
+                    "tag": "24-2000:Mg.Sulfur",
+                    "value": value + 0.1,
+                },
+            ]
+        )
+    telemetry = pd.DataFrame(
+        {
+            "date": days,
+            "P8": range(len(days)),
+            "T11": [100 + index for index in range(len(days))],
+            "F19": [200 + index for index in range(len(days))],
+        }
+    )
+
+    report = forecast.evaluate_forecasts(
+        pd.DataFrame(rows),
+        horizons=(0,),
+        telemetry=telemetry,
+        telemetry_lags=(0, 1, 2, 3),
+    )
+
+    ridge = report[report["model"] == "ridge_telemetry"]
+    assert set(ridge["telemetry_lag_hours"].dropna()) == {0.0, 1.0, 2.0, 3.0}
+    assert len(ridge[ridge["split"] == "test"]) == 1
+    assert ridge[ridge["split"] == "test"]["selected"].eq(True).all()
+    assert report["evidence_type"].eq("backtested").all()
+    assert {"lims_age_hours_median", "pak_age_hours_median", "P8_age_hours_median"} <= set(report)
