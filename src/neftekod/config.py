@@ -18,6 +18,8 @@ LONG_FORMAT_CSV = BUILD_DIR / "lims_pak_long.csv"
 TAG_MAP_CSV = BUILD_DIR / "tag_map.csv"
 COVERAGE_CSV = BUILD_DIR / "coverage_report.csv"
 COVERAGE_MD = BUILD_DIR / "coverage_report.md"
+FORECAST_CSV = BUILD_DIR / "forecast_report.csv"
+FORECAST_MD = BUILD_DIR / "forecast_report.md"
 
 # Время ЛИМС — отбор пробы, публикация до 4 часов позже. При отсутствии
 # фактического времени публикации используем консервативную верхнюю границу.
