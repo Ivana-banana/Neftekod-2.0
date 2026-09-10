@@ -82,11 +82,10 @@ def test_first_seen_is_per_tag_not_global(lims_long, pak_long):
     assert (frame.groupby("tag")["timestamp"].min() == frame.groupby("tag")["first_seen"].first()).all()
 
 
-def test_unit_conflicts_are_reported_not_fixed(lims_long):
+def test_original_unit_conflicts_remain_visible(lims_long):
     """Единицы блока «АВТ.1» не совпадают с остальными блоками — см. ADR-005.
 
-    Автоматически «починить» их нельзя: какая строка заголовка сдвинута —
-    вопрос к организаторам. Парсер обязан отдать расхождение наружу.
+    Исправление нормализованной единицы не должно затирать исходный заголовок.
     """
     conflicts = parse_lims_pak.unit_conflicts(lims_long)
     assert set(conflicts["indicator"]) == {"50%.T", "D15", "EBP.T", "I350"}
@@ -118,3 +117,81 @@ def test_sulfur_unit_difference_is_surfaced(lims_long, pak_long):
 @pytest.mark.parametrize("column", parse_lims_pak.LONG_COLUMNS)
 def test_long_format_columns(lims_long, column):
     assert column in lims_long.columns
+
+
+def test_lims_units_follow_indicators_without_changing_values(lims_long):
+    """Сдвиг заголовка не должен менять число или давать плотность в °C."""
+    from openpyxl import load_workbook
+    from neftekod import config
+
+    assert {"unit", "unit_basis"} <= set(lims_long)
+    expected = {
+        "50%.T": ("E5", "кг/м3", "°C"),
+        "EBP.T": ("G5", "% об.", "°C"),
+        "D15": ("K5", "°С", "кг/м3"),
+        "I350": ("M5", "°С", "% об."),
+    }
+    workbook = load_workbook(config.LIMS_XLSX, read_only=True, data_only=True)
+    try:
+        sheet = workbook.worksheets[0]
+        for indicator, (date_cell, declared, unit) in expected.items():
+            raw_date = sheet[date_cell]
+            raw_value = sheet.cell(raw_date.row, raw_date.column + 1).value
+            rows = lims_long[lims_long["tag"] == f"LIMS:АВТ.1.{indicator}"]
+            assert set(rows["unit_declared"]) == {declared}
+            assert set(rows["unit"]) == {unit}
+            assert set(rows["unit_basis"]) == {"organizer_indicator"}
+            point = rows[rows["timestamp"] == pd.Timestamp(raw_date.value)].iloc[0]
+            assert point["value"] == pytest.approx(float(str(raw_value).replace(",", ".")))
+    finally:
+        workbook.close()
+
+
+def test_mass_ppm_is_normalized_without_rescaling(pak_long, lims_long):
+    from openpyxl import load_workbook
+    from neftekod import config
+
+    assert {"unit", "unit_basis"} <= set(pak_long)
+    sulfur = pak_long[pak_long["tag"] == "24-2000:Mg.Sulfur"]
+    lab = lims_long[lims_long["tag"] == "LIMS:Гидроочистка.2.Mg.Sulfur"]
+    assert set(sulfur["unit"]) == set(lab["unit"]) == {"мг/кг"}
+    assert set(sulfur["unit_declared"]) == {"ppm"}
+    assert set(sulfur["unit_basis"]) == {"mass_ppm_equivalence"}
+    workbook = load_workbook(config.PAK_XLSX, read_only=True, data_only=True)
+    try:
+        rows = list(workbook.worksheets[0].iter_rows(max_row=3, values_only=True))
+        col = rows[0].index("24-2000:Mg.Sulfur")
+        timestamp, raw_value = rows[2][col:col + 2]
+        point = sulfur[sulfur["timestamp"] == pd.Timestamp(timestamp)].iloc[0]
+        assert point["value"] == float(str(raw_value).replace(",", "."))
+    finally:
+        workbook.close()
+
+
+def test_lims_availability_keeps_sample_time(lims_long):
+    assert {"available_at", "availability_basis"} <= set(lims_long)
+    assert (lims_long["available_at"] - lims_long["timestamp"]).eq(pd.Timedelta(hours=4)).all()
+    assert set(lims_long["availability_basis"]) == {"sample_time_plus_4h_conservative"}
+    # Охват по отбору не сдвигается вместе с доступностью признаков.
+    sulfur = lims_long[lims_long["tag"] == "LIMS:Гидроочистка.2.Mg.Sulfur"]
+    assert sulfur["timestamp"].min() == pd.Timestamp("2023-01-01 10:00")
+
+
+def test_pak_availability_has_no_invented_lab_delay(pak_long):
+    assert {"available_at", "availability_basis"} <= set(pak_long)
+    assert pak_long["available_at"].equals(pak_long["timestamp"])
+    assert set(pak_long["availability_basis"]) == {"measurement_time_assumed"}
+
+
+def test_csv_export_roundtrips_all_times(lims_long, pak_long, tmp_path):
+    """Формат даты не должен зависеть от соседних колонок или чанка pandas."""
+    frame = pd.concat([lims_long, pak_long], ignore_index=True).sort_values(
+        ["source", "tag", "timestamp"]
+    ).reset_index(drop=True)
+    path = tmp_path / "long.csv"
+    parse_lims_pak.write_long_format(frame, path)
+    times = ["timestamp", "available_at", "first_seen"]
+    loaded = pd.read_csv(path, parse_dates=times)
+    for column in times:
+        assert pd.api.types.is_datetime64_any_dtype(loaded[column]), column
+        pd.testing.assert_series_equal(loaded[column], frame[column], check_dtype=False)

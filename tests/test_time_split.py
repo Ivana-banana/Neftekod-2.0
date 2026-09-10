@@ -52,3 +52,36 @@ def test_real_data_split_is_non_degenerate(lims_long, pak_long):
         assert "24-2000:Mg.Sulfur" in tags
         assert "24-2000:D15" in tags
         assert "LIMS:Гидроочистка.2.Mg.Sulfur" in tags
+
+
+def test_no_feature_leakage_from_unpublished_lab_result():
+    frame = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2026-01-01 08:00"]),
+        "available_at": pd.to_datetime(["2026-01-01 12:00"]),
+        "source": ["lims"],
+        "value": [8.0],
+    })
+    with pytest.raises(ValueError, match="утечка из будущего"):
+        splits.assert_no_leakage(frame, "2026-01-01 11:59:59")
+    splits.assert_no_leakage(frame, "2026-01-01 12:00")
+
+
+@pytest.mark.parametrize("available", [None, pd.NaT, "2026-01-01 07:00"])
+def test_leakage_check_rejects_missing_or_impossible_availability(available):
+    frame = pd.DataFrame({"timestamp": ["2026-01-01 08:00"], "source": ["lims"]})
+    if available is not None:
+        frame["available_at"] = available
+    with pytest.raises(ValueError, match="доступност"):
+        splits.assert_no_leakage(frame, "2026-01-02")
+
+
+@pytest.mark.parametrize("invalid_column", ["timestamp", "prediction_time"])
+def test_leakage_check_rejects_unknown_times(invalid_column):
+    frame = pd.DataFrame({"timestamp": [pd.Timestamp("2026-01-01")]})
+    cutoff = pd.Timestamp("2026-01-02")
+    if invalid_column == "timestamp":
+        frame["timestamp"] = pd.NaT
+    else:
+        cutoff = pd.NaT
+    with pytest.raises(ValueError):
+        splits.assert_no_leakage(frame, cutoff)

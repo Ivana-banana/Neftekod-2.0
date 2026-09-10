@@ -6,9 +6,9 @@
     python scripts/prepare_data.py
 
 Результат в `build/`:
-    lims_pak_long.csv    — (timestamp, tag, value, source, unit_declared,
-                            sample_point, indicator, first_seen)
-    tag_map.csv          — КИП+ЛА+ПАК+ВАК в одной таблице
+    lims_pak_long.csv    — исходные значения, нормализованные единицы,
+                          время отбора/измерения и доступности с основаниями
+    tag_map.csv          — КИП+ЛА+ПАК+ВАК, исправления и оригиналы формул
     coverage_report.csv  — покрытие/актуальность по каждому показателю
     coverage_report.md   — то же плюс разрывы охвата и конфликты единиц
     unit_conflicts.csv   — расхождения единиц (ADR-005)
@@ -41,7 +41,8 @@ def main() -> int:
 
     log.info("1/4 разбор ЛИМС и ПАК")
     long_format = parse_lims_pak.build_long_format()
-    long_format.to_csv(config.LONG_FORMAT_CSV, index=False)
+    parse_lims_pak.write_long_format(long_format, config.LONG_FORMAT_CSV)
+    log.info("  ЛИМС: доступность = отбор + 4ч (консервативно); ПАК: время измерения (допущение)")
     log.info(
         "  %d значений, %d показателей → %s",
         len(long_format),
@@ -52,6 +53,11 @@ def main() -> int:
     log.info("2/4 карта тегов")
     tags = tag_map.attach_units_from_exports(tag_map.build_tag_map(), long_format)
     tags.to_csv(config.TAG_MAP_CSV, index=False)
+    log.info(
+        "  ВАК: %d поправок организаторов; %d формул заблокированы из-за Pipeline",
+        tags["formula_source"].eq("organizer_clarifications_2026-09-10").sum(),
+        tags["formula_status"].eq("blocked_pipeline").sum(),
+    )
     without_unit = tag_map.tags_without_unit(tags)
     log.info(
         "  %d записей → %s; без подтверждённой единицы: %d",
@@ -69,7 +75,7 @@ def main() -> int:
     late = report[report["lag_from_dataset_start_days"] > 30]
     log.info(
         "  %d показателей → %s; охват начинается позже начала выгрузки у %d; "
-        "конфликтов единиц (ADR-005): %d",
+        "расхождений исходных единиц после нормализации (ADR-005): %d",
         len(report),
         config.COVERAGE_MD.name,
         len(late),

@@ -19,6 +19,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from . import config
+from .formula_corrections import FORMULA_SOURCE, VAK_CORRECTIONS
 
 MAP_COLUMNS = [
     "code",
@@ -28,6 +29,9 @@ MAP_COLUMNS = [
     "installation",
     "sample_point",
     "notes",
+    "formula_original",
+    "formula_source",
+    "formula_status",
 ]
 
 
@@ -143,10 +147,16 @@ def _vak_records(rows: list[tuple]) -> list[dict]:
             code = _clean(row[col])
             if not code:
                 continue
-            formula = _clean(row[col + 1])
+            original = _clean(row[col + 1])
+            formula = VAK_CORRECTIONS.get(code, original)
+            corrected = code in VAK_CORRECTIONS
+            status = "corrected_unvalidated" if corrected else "original_unvalidated"
             note = "формула не проверена: ADR-002"
+            if corrected:
+                note = "исправлено по ответу организаторов; точность не проверена: ADR-002"
             if formula and "Pipeline" in formula:
-                note = "формула ссылается на точку Pipeline, отсутствующую в ЛИМС: ADR-003"
+                status = "blocked_pipeline"
+                note += "; точка Pipeline не сопоставлена с ЛИМС: ADR-003"
             records.append(
                 {
                     "code": code,
@@ -156,6 +166,9 @@ def _vak_records(rows: list[tuple]) -> list[dict]:
                     "installation": installation,
                     "sample_point": None,
                     "notes": note,
+                    "formula_original": original,
+                    "formula_source": FORMULA_SOURCE if corrected else "source_xlsx",
+                    "formula_status": status,
                 }
             )
     return records
@@ -209,7 +222,7 @@ def sheet_record_counts(path: Path | None = None) -> dict[str, int]:
 
 
 def attach_units_from_exports(tag_map: pd.DataFrame, long_format: pd.DataFrame) -> pd.DataFrame:
-    """Проставить единицы там, где их объявляет сам файл выгрузки (ПАК).
+    """Проставить нормализованные единицы выгрузки ПАК по точному имени тега.
 
     Единицы берутся из данных, а не из справочника: в справочнике их нет.
     Строка `unit` остаётся пустой для КИП/ЛА/ВАК — подтверждённого источника
@@ -218,7 +231,7 @@ def attach_units_from_exports(tag_map: pd.DataFrame, long_format: pd.DataFrame) 
     declared = (
         long_format[long_format["source"] == "pak"]
         .drop_duplicates("tag")
-        .set_index("tag")["unit_declared"]
+        .set_index("tag")["unit"]
     )
     result = tag_map.copy()
     result["unit"] = result["unit"].astype("object")
@@ -234,9 +247,9 @@ def tags_without_unit(tag_map: pd.DataFrame) -> pd.DataFrame:
 def duplicate_descriptions(tag_map: pd.DataFrame) -> pd.DataFrame:
     """Коды листа «КИП», у которых внутри установки совпадает описание.
 
-    Один поток — одно описание: два разных кода с дословно одинаковым текстом
-    означают, что описание не определяет колонку однозначно. На данных такие
-    пары расходятся (см. ADR-007), поэтому это не косметика справочника.
+    Описание не определяет колонку однозначно. Дубликат сам по себе не
+    доказывает ошибку сопоставления: соответствие подтверждено организаторами,
+    единицы и масштабы остаются открытыми (см. ADR-007).
 
         installation | description | codes
     """

@@ -15,8 +15,10 @@ LIMS (`lims_export_2023.xlsx`)      PAK (`pak_export_2023.xlsx`)
   строка 5+: данные (дата, значение)
 
 Результат — long-format `(timestamp, tag, value, source, ...)`, где на каждое
-значение сохранён `first_seen` — первая дата наличия этого показателя
-(п. 4 плана в SKILL.md): после свода в long-format её уже не восстановить.
+значение сохранён `first_seen` — первая дата наличия этого показателя.
+`timestamp` остаётся временем отбора/измерения, `available_at` — оценка
+доступности для признаков. `unit_declared` сохраняет исходную единицу,
+`unit` — нормализованную; численные значения не масштабируются.
 """
 
 from __future__ import annotations
@@ -42,7 +44,20 @@ LONG_COLUMNS = [
     "sample_point",
     "indicator",
     "first_seen",
+    "unit",
+    "unit_basis",
+    "available_at",
+    "availability_basis",
 ]
+
+# Организаторы подтвердили ошибку строки единиц: названия показателей верны.
+# См. ADR-005. Это исправление метаданных, не масштабирование значений.
+LIMS_INDICATOR_UNITS = {
+    "50%.T": "°C",
+    "EBP.T": "°C",
+    "D15": "кг/м3",
+    "I350": "% об.",
+}
 
 # Справочник «ПАК» (docs/tz/tags_hackathon.md) называет тег серы `24-2000:Mg.Sulfur.Q`,
 # в самом pak_export_2023.xlsx колонка называется `24-2000:Mg.Sulfur`.
@@ -189,6 +204,27 @@ def _extract(path: Path, source: str, header_rows: int, headers_fn) -> pd.DataFr
         frame["unit_declared"] = header.unit_declared
         frame["sample_point"] = header.sample_point
         frame["indicator"] = header.indicator
+        frame["unit"] = {"°С": "°C"}.get(header.unit_declared, header.unit_declared)
+        frame["unit_basis"] = "declared"
+        if source == "lims":
+            if header.indicator in LIMS_INDICATOR_UNITS:
+                frame["unit"] = LIMS_INDICATOR_UNITS[header.indicator]
+                frame["unit_basis"] = "organizer_indicator"
+            # См. ADR-006: не переносим время цели на время её публикации.
+            frame["available_at"] = frame["timestamp"] + pd.Timedelta(
+                hours=config.LIMS_PUBLICATION_DELAY_HOURS
+            )
+            frame["availability_basis"] = "sample_time_plus_4h_conservative"
+        else:
+            # Для ПАК задержка не предоставлена; это явное допущение,
+            # а не подтверждённый момент публикации.
+            frame["available_at"] = frame["timestamp"]
+            frame["availability_basis"] = "measurement_time_assumed"
+            if header.tag == PAK_TAG_IN_FILE and header.unit_declared == "ppm":
+                # См. ADR-001/005: только подтверждённая массовая сера,
+                # 1 ppm = 1 мг/кг. Не распространять на неизвестные ppm.
+                frame["unit"] = "мг/кг"
+                frame["unit_basis"] = "mass_ppm_equivalence"
         # Первая дата наличия показателя: охват у каждого свой (например,
         # 24-2000:D15 начинается только с 2025-03-05), и через такой разрыв
         # интерполировать нельзя — см. SKILL.md.
@@ -249,9 +285,8 @@ def lims_declared_counts(path: Path | None = None) -> dict[str, int | None]:
 def unit_conflicts(frame: pd.DataFrame) -> pd.DataFrame:
     """Показатели, у которых в разных блоках заявлены разные единицы.
 
-    Не исправляется автоматически: какая из единиц верна — вопрос к
-    организаторам (см. ADR-005). Задача функции — не дать расхождению
-    пройти незамеченным.
+    Исходные расхождения сохраняются для аудита после нормализации единиц
+    по ответу организаторов (см. ADR-005).
     """
     per_indicator = (
         frame.drop_duplicates(["indicator", "unit_declared", "tag"])
@@ -262,7 +297,9 @@ def unit_conflicts(frame: pd.DataFrame) -> pd.DataFrame:
     return (
         frame[frame["indicator"].isin(conflicting)]
         .drop_duplicates(["indicator", "unit_declared", "tag"])
-        .loc[:, ["indicator", "unit_declared", "tag"]]
+        .loc[:, ["indicator", "unit_declared", "tag"] + [
+            column for column in ("unit", "unit_basis") if column in frame
+        ]]
         .sort_values(["indicator", "unit_declared", "tag"])
         .reset_index(drop=True)
     )
@@ -273,9 +310,18 @@ def build_long_format() -> pd.DataFrame:
     return frame.sort_values(["source", "tag", "timestamp"]).reset_index(drop=True)
 
 
+def write_long_format(frame: pd.DataFrame, path: Path) -> None:
+    """Единый формат времени CSV, включая полночь и доли секунды.
+
+    Автоформат pandas зависит от содержимого чанка и может смешать дату
+    без времени с полной датой внутри first_seen, ломая read_csv(parse_dates).
+    """
+    frame.to_csv(path, index=False, date_format="%Y-%m-%d %H:%M:%S.%f")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     long_format = build_long_format()
     config.BUILD_DIR.mkdir(exist_ok=True)
-    long_format.to_csv(config.LONG_FORMAT_CSV, index=False)
+    write_long_format(long_format, config.LONG_FORMAT_CSV)
     print(f"{len(long_format)} строк → {config.LONG_FORMAT_CSV}")

@@ -19,6 +19,11 @@ TAG_MAP_CSV = BUILD_DIR / "tag_map.csv"
 COVERAGE_CSV = BUILD_DIR / "coverage_report.csv"
 COVERAGE_MD = BUILD_DIR / "coverage_report.md"
 
+# Время ЛИМС — отбор пробы, публикация до 4 часов позже. При отсутствии
+# фактического времени публикации используем консервативную верхнюю границу.
+# См. ADR-006 и docs/tz/organizer-clarifications.md.
+LIMS_PUBLICATION_DELAY_HOURS = 4
+
 # Разбиение по времени — см. ADR-006. Границы зафиксированы до обучения
 # моделей и не подбираются по результатам.
 TRAIN_END = "2025-12-24 23:59:59"

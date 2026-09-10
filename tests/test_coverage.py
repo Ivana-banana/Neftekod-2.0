@@ -34,3 +34,36 @@ def test_freshness_uses_only_past_values(lims_long):
     # Показатели, которых на эту дату ещё нет, в таблицу не попадают —
     # «последнее известное значение» для них не выдумывается.
     assert "LIMS:АВТ.1.CloudPoint_1" not in set(fresh["tag"])
+
+
+def test_freshness_waits_for_publication_and_uses_sample_age():
+    """В 11:59 свежим остаётся старый анализ; в 12:00 доступен утренний."""
+    frame = pd.DataFrame({
+        "tag": ["lab", "lab", "pak", "late"],
+        "source": ["lims", "lims", "pak", "pak"],
+        "timestamp": pd.to_datetime([
+            "2026-01-01 00:00", "2026-01-01 08:00", "2026-01-01 11:50", "2026-01-02 00:00",
+        ]),
+        "available_at": pd.to_datetime([
+            "2026-01-01 04:00", "2026-01-01 12:00", "2026-01-01 11:50", "2026-01-02 00:00",
+        ]),
+        "value": [9.0, 7.0, 8.0, 10.0],
+    })
+    before = coverage.freshness(frame, pd.Timestamp("2026-01-01 11:59:59")).set_index("tag")
+    assert before.loc["lab", "last_value_ts"] == pd.Timestamp("2026-01-01 00:00")
+    assert before.loc["pak", "last_value_ts"] == pd.Timestamp("2026-01-01 11:50")
+    assert "late" not in before.index
+    at = coverage.freshness(frame, pd.Timestamp("2026-01-01 12:00")).set_index("tag")
+    assert at.loc["lab", "last_value_ts"] == pd.Timestamp("2026-01-01 08:00")
+    assert at.loc["lab", "age_hours"] == 4.0
+
+
+def test_freshness_does_not_treat_non_numeric_marker_as_new_analysis():
+    frame = pd.DataFrame({
+        "tag": ["lab", "lab"], "source": ["lims", "lims"],
+        "timestamp": pd.to_datetime(["2026-01-01 00:00", "2026-01-01 08:00"]),
+        "available_at": pd.to_datetime(["2026-01-01 04:00", "2026-01-01 12:00"]),
+        "value": [9.0, float("nan")],
+    })
+    fresh = coverage.freshness(frame, pd.Timestamp("2026-01-01 12:00"))
+    assert fresh.iloc[0]["last_value_ts"] == pd.Timestamp("2026-01-01 00:00")

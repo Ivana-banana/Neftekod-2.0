@@ -16,13 +16,18 @@ from __future__ import annotations
 
 import pandas as pd
 
-from . import config, parse_lims_pak
+from . import config, parse_lims_pak, splits
 
 REPORT_COLUMNS = [
     "tag",
     "source",
     "sample_point",
     "unit_declared",
+    "unit",
+    "unit_basis",
+    "availability_basis",
+    "first_available_at",
+    "last_available_at",
     "n_values",
     "n_non_numeric",
     "first_seen",
@@ -51,6 +56,11 @@ def build_coverage_report(long_format: pd.DataFrame) -> pd.DataFrame:
                 "source": series["source"].iloc[0],
                 "sample_point": series["sample_point"].iloc[0],
                 "unit_declared": series["unit_declared"].iloc[0],
+                "unit": series["unit"].iloc[0],
+                "unit_basis": series["unit_basis"].iloc[0],
+                "availability_basis": series["availability_basis"].iloc[0],
+                "first_available_at": series["available_at"].min(),
+                "last_available_at": series["available_at"].max(),
                 "n_values": len(series),
                 "n_non_numeric": int(series["value"].isna().sum()),
                 "first_seen": stamps.min(),
@@ -80,14 +90,17 @@ def build_coverage_report(long_format: pd.DataFrame) -> pd.DataFrame:
 
 
 def freshness(long_format: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
-    """Возраст последнего значения каждого показателя на момент `as_of`.
+    """Возраст последнего доступного числового значения на момент `as_of`.
 
     Используется агентами: устаревший лабораторный анализ — основание для
     отказа от рекомендации, а не повод «подставить последнее известное».
     """
-    last = long_format[long_format["timestamp"] <= as_of].groupby("tag")["timestamp"].max()
+    known = splits.available_history(long_format, as_of)
+    last = known.dropna(subset=["value"]).groupby("tag")["timestamp"].max()
     frame = last.rename("last_value_ts").reset_index()
-    frame["age_hours"] = (as_of - frame["last_value_ts"]).dt.total_seconds() / 3600
+    # Возраст от отбора, а не от публикации: свежедоступный анализ уже имеет
+    # возраст до четырёх часов. См. ADR-006.
+    frame["age_hours"] = (pd.Timestamp(as_of) - frame["last_value_ts"]).dt.total_seconds() / 3600
     return frame.sort_values("age_hours", ascending=False).reset_index(drop=True)
 
 
@@ -112,7 +125,19 @@ def to_markdown(report: pd.DataFrame, conflicts: pd.DataFrame) -> str:
         "",
         "## Конфликты единиц измерения (ADR-005)",
         "",
+        "Показаны исходные заголовки и нормализованные единицы. Ошибка строки единиц",
+        "ЛИМС подтверждена организаторами; массовая сера ПАК: 1 ppm = 1 мг/кг.",
+        "Числа сохранены без масштабирования, расхождения заголовков оставлены для аудита.",
+        "",
         conflicts.to_markdown(index=False) if len(conflicts) else "нет",
+        "",
+        "## Доступность для исторических признаков (ADR-006)",
+        "",
+        "`timestamp` — отбор/измерение; `available_at` — оценка времени доступности.",
+        "ЛИМС: отбор + 4 часа (консервативно, точных публикаций нет).",
+        "ПАК: время измерения (допущение, задержка не предоставлена).",
+        "Возраст анализа считается от отбора. Лабораторные цели не сдвигаются.",
+        "Все источники в одном часовом поясе, его название не задано; UTC не назначается.",
         "",
         "## Полный отчёт",
         "",
