@@ -163,6 +163,27 @@ class TestQuality:
         assert assessment.training_range["T11_value"]["in_training_range"] is False
         assert all(item["in_training_range"] is False for item in assessment.forecast)
 
+    def test_distance_to_the_edge_is_visible_not_only_the_flag(self, scenario_context):
+        """Значение у самого края формально «внутри» — это должно быть видно."""
+        position = scenario_context.training_stats["T11_value"]
+        edge = position["p99"] - 1e-9
+        near_edge = dataclasses.replace(
+            scenario_context, snapshot=scenario_context.snapshot | {"T11_value": edge}
+        )
+        assessment = quality.assess(near_edge)
+        item = assessment.training_range["T11_value"]
+        assert item["in_training_range"] is True
+        assert item["relative_position"] == pytest.approx(1.0, abs=1e-6)
+
+    def test_unconfirmed_units_are_flagged_next_to_freshness(self, scenario_context):
+        confidence = quality.assess(scenario_context).data_confidence
+        assert confidence["P8"]["units_confirmed"] is False
+        assert confidence["lims_sulfur"]["units_confirmed"] is True
+
+    def test_risk_thresholds_are_declared_as_assumption(self, scenario_context):
+        assumptions = quality.assess(scenario_context).assumptions
+        assert any("backtest-RMSE" in item for item in assumptions)
+
     def test_stale_analysis_is_refused_not_guessed(self):
         context = _context(long_format=_long_format(last_sample="2026-01-30 10:00:00"))
         assessment = quality.assess(context)
@@ -193,6 +214,23 @@ class TestReliability:
         assessment = reliability.assess(scenario_context)
         assert any("прокси" in item for item in assessment.assumptions)
         assert any("ADR-007" in item for item in assessment.assumptions)
+
+    def test_fast_excursion_becomes_a_risk_factor(self):
+        """Скачок внутри окна не должен молча тонуть в спокойном std."""
+        telemetry = _telemetry()
+        window = telemetry["timestamp"] >= WINDOW_START
+        spike = telemetry.index[window][len(telemetry.index[window]) // 2]
+        stats_width = 250.0 - 150.0
+        telemetry.loc[spike, "F19"] = telemetry.loc[spike, "F19"] + 2 * stats_width
+        assessment = reliability.assess(_context(telemetry=telemetry))
+        assert assessment.refusal is None
+        assert any("скорост" in factor for factor in assessment.risk_factors)
+
+    def test_admissibility_threshold_is_declared_as_assumption(self, scenario_context):
+        assessment = reliability.assess(scenario_context)
+        assert any(
+            str(reliability.ADMISSIBLE_SEVERITY_MAX) in item for item in assessment.assumptions
+        )
 
     def test_missing_signal_gives_refusal_not_a_score(self):
         """История сигнала есть, но актуального значения на момент выдачи нет."""

@@ -20,7 +20,7 @@ from .context import TRAINING_FEATURES, ScenarioContext
 BASELINE_MODEL = "persistence"
 # Отбор ЛИМС суточный (10:00), публикация +4 ч. Анализ старше 48 часов
 # означает, что как минимум одна проба пропущена: persistence на таком
-# основании не выдаётся. Модельное допущение сценария, не норматив.
+# основании не выдаётся. Модельное допущение сценария — см. ADR-010.
 MAX_BASELINE_AGE_HOURS = 48.0
 
 
@@ -64,12 +64,17 @@ def _training_range(context: ScenarioContext) -> dict:
     for name in TRAINING_FEATURES:
         stats = context.training_stats[name]
         value = context.snapshot.get(name)
+        width = stats["p99"] - stats["p01"]
         report[name] = {
             "value": value,
             "train_min": stats["min"],
             "train_p01": stats["p01"],
             "train_p99": stats["p99"],
             "train_max": stats["max"],
+            # Бинарного флага мало: значение на 0.97 ширины формально «внутри»,
+            # но любое повышение выводит его наружу. Оптимизатор должен видеть
+            # запас до границы заранее, а не постфактум.
+            "relative_position": None if value is None or width <= 0 else (value - stats["p01"]) / width,
             "in_training_range": (
                 value is not None and stats["p01"] <= value <= stats["p99"]
             ),
@@ -90,6 +95,10 @@ def _data_confidence(context: ScenarioContext) -> dict:
             "value": snapshot.get(value_key),
             "age_hours": snapshot.get(age_key),
             "missing": bool(snapshot.get(missing_key)),
+            # Свежесть сигнала не означает, что он понят: единицы и масштаб
+            # P8/T11/F19 организаторами не подтверждены (ADR-007). Без этой
+            # пометки «age 0, missing false» читается как полное доверие.
+            "units_confirmed": name in ("lims_sulfur", "pak_sulfur"),
         }
         for name, (value_key, age_key, missing_key) in sources.items()
     }
@@ -114,6 +123,11 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         "буквальные min/max содержат остановы и выбросы и ничего не ограничивают.",
         "ПАК приводится как независимый свежий сигнал, но в прогноз не входит: "
         "задержка публикации ПАК организаторами не подтверждена (ADR-009).",
+        "Классы риска заданы в единицах backtest-RMSE: запас меньше одной RMSE — "
+        "high, меньше двух — moderate. Внешнего обоснования у этих границ нет, "
+        "это модельный порог сценария (ADR-010).",
+        "Единицы P8/T11/F19 не подтверждены (ADR-007): в data_confidence они "
+        "помечены units_confirmed = false, свежесть сигнала доверия к ним не даёт.",
     ]
     in_range = all(item["in_training_range"] for item in training_range.values())
 

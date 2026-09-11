@@ -56,6 +56,7 @@ def training_stats(long_format: pd.DataFrame, telemetry: pd.DataFrame) -> dict:
     p01–p99 — охват без выбросов, по нему решается «вне диапазона обучения»;
     p05–p95 — рутинная работа установки без хвостов и остановов, из неё
     агент надёжности строит консервативный модельный диапазон режима.
+    Выбор трёх срезов и их назначение — см. ADR-010.
     """
     train_end = pd.Timestamp(config.TRAIN_END)
     quality = long_format[pd.to_datetime(long_format["timestamp"]) <= train_end]

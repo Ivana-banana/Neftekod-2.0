@@ -51,7 +51,7 @@ def _assert_contract(submission: dict) -> None:
 
     Проверка не косметическая: если сюда просочатся кандидаты, метрики
     перебора или обоснования исполнителя, adversarial-ревью превратится в
-    пересказ чужого вывода.
+    пересказ чужого вывода. См. ADR-010.
     """
     extra = set(submission) - SUBMISSION_KEYS
     if extra:

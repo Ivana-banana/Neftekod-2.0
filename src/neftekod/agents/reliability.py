@@ -29,7 +29,13 @@ ADMISSIBLE_SEVERITY_MAX = 0.5
 # на момент выдачи означает молчащий сигнал, а не спокойный режим: as-of
 # подставляет последнее конечное измерение, каким бы старым оно ни было
 # (ADR-009), поэтому «не пропущено» само по себе ничего не гарантирует.
+# См. ADR-010.
 MAX_SIGNAL_AGE_HOURS = 1.0
+# Скорость изменения сигнала, при которой он проходит всю рутинную полосу
+# быстрее чем за час. Порождает фактор риска, но НЕ входит в severity_index:
+# ограничений скорости изменения в задаче не задано (ответы организаторов),
+# и придумывать за них предел нельзя. См. ADR-010.
+FAST_EXCURSION_BANDS_PER_HOUR = 1.0
 
 
 @dataclass(frozen=True)
@@ -96,6 +102,12 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
         f"Сигнал старше {MAX_SIGNAL_AGE_HOURS:g} ч на момент выдачи считается "
         "молчащим: as-of подставляет последнее конечное измерение любой "
         "давности, поэтому «значение есть» не означает «сигнал живой».",
+        f"Скорость изменения свыше {FAST_EXCURSION_BANDS_PER_HOUR:g} ширины полосы в час "
+        "даёт фактор риска, но в severity_index не входит: ограничений скорости "
+        "изменения организаторы не задали, и придумывать предел за них нельзя.",
+        f"Граница допустимости режима severity_index < {ADMISSIBLE_SEVERITY_MAX:g} — "
+        "модельный порог, выбранный до прогона сценариев и не подобранный по "
+        "результату. Внешнего обоснования у него нет.",
         "Границы allowed_ranges — консервативный модельный диапазон по "
         "истории обучения. Это допущение для эксперимента, а не промышленный "
         "предел (ТЗ, §4, «Правило границ»).",
@@ -164,6 +176,7 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
             "window_instability": instability,
             "max_abs_rate_per_hour": max_rate,
             "p95_abs_rate_per_hour": p95_rate,
+            "max_rate_in_bands_per_hour": None if max_rate is None else max_rate / width,
         }
         excursions.append(outside)
         instabilities.append(instability)
@@ -171,6 +184,14 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
             risk_factors.append(f"{tag} вне полосы p05–p95 обучающей выборки на {outside:.3f} ширины")
         if instability > 0.1:
             risk_factors.append(f"{tag} нестабилен внутри окна: std = {instability:.3f} ширины полосы")
+        # Спокойный std за окно прячет короткий скачок: без этой проверки
+        # период с броском на несколько ширин полосы за час назывался бы
+        # устойчивым. Найдено прогоном роли на сценарии 1.
+        if max_rate is not None and max_rate / width > FAST_EXCURSION_BANDS_PER_HOUR:
+            risk_factors.append(
+                f"{tag}: скорость изменения до {max_rate / width:.2f} ширины полосы в час "
+                "внутри окна — короткий бросок, не видимый в std за всё окно"
+            )
 
     severity = min(1.0, max(excursions) + max(instabilities))
     return ReliabilityAssessment(
