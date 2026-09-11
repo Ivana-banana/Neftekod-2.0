@@ -4,10 +4,12 @@
 
 Каждый кандидат несёт машиночитаемое поле `evidence_type`:
 
-- `backtested` — прогноз проверен на отложенной по времени истории
-  (persistence, ADR-008). Это относится только к сохранению текущего режима:
-  «ничего не меняем» — единственное действие, последствие которого история
-  действительно показывала.
+- `backtested` — на отложенной по времени истории проверена **ошибка
+  прогноза**, а не последствие действия. Такую подпись имеет право нести
+  только сохранение текущего режима: там прогноз и есть весь вывод, ничего
+  сверх измеренного не утверждается. История при этом не была чистым режимом
+  «ничего не меняем», так что даже здесь backtest говорит о происхождении
+  числа, а не о безопасности режима.
 - `simulated_unvalidated` — модельная оценка эффекта ещё не случавшегося
   воздействия. Симулятора установки нет, историей такая оценка не
   подтверждается по построению.
@@ -30,6 +32,15 @@ from .reliability import ReliabilityAssessment
 # Абсолютный шаг в «градусах» или «т/ч» задать нельзя: единицы сигналов не
 # подтверждены (ADR-007). См. ADR-010.
 SETPOINT_STEP_FRACTION = 0.05
+
+# Машиночитаемые причины отклонения: разбирать русскую строку подстрокой —
+# не способ классификации ни для теста, ни для интерфейса оператора.
+REJECTION_CODES = (
+    "hard_constraint",
+    "insufficient_margin",
+    "unvalidated_effect_model",
+    "regime_inadmissible",
+)
 
 
 @dataclass(frozen=True)
@@ -172,6 +183,7 @@ def _candidate(
         "rejection_reasons": [
             f"жёсткое ограничение {violation.rule}: {violation.detail}" for violation in violations
         ],
+        "rejection_codes": ["hard_constraint"] * len(violations),
     }
 
 
@@ -196,7 +208,8 @@ def propose(
         "Жёсткие ограничения проверяются у каждого кандидата через "
         "constraints.validate_recommendation; нарушение отклоняет кандидата целиком.",
         "Кандидат, меняющий режим, дополнительно обязан оставить запас по сере "
-        "не меньше backtest-RMSE прогноза: иначе выигрыш лежит внутри ошибки. "
+        "не меньше backtest-RMSE прогноза на худшем из горизонтов действия "
+        "(0–3 ч), а не на ближайшем: иначе выигрыш лежит внутри ошибки. "
         "Сохранение текущего режима от этого требования освобождено — это не "
         "действие, а статус-кво.",
         "Кандидат, эффект которого предсказан моделью, не выигравшей у "
@@ -227,7 +240,13 @@ def propose(
     horizon = min(context.backtest)
     baseline_forecast = next(item for item in quality.forecast if item["horizon_hours"] == horizon)
     baseline_sulfur = baseline_forecast["predicted_sulfur_mg_kg"]
-    forecast_rmse = baseline_forecast["backtest_rmse_mg_kg"]
+    # Порог действия берётся по ХУДШЕМУ горизонту, а не по ближайшему:
+    # рекомендация действует на 0–3 часа (ответы организаторов), и настраивать
+    # «гейт» на самую выгодную из измеренных ошибок значит пропускать впритык
+    # то, что на реальном горизонте действия не проходит. См. ADR-010.
+    worst = max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"])
+    forecast_rmse = worst["backtest_rmse_mg_kg"]
+    forecast_rmse_horizon = worst["horizon_hours"]
     current_setpoints = {
         tag: context.snapshot[f"{tag}_value"] for tag in features.TELEMETRY_TAGS
     }
@@ -336,13 +355,16 @@ def propose(
 
     for candidate in candidates:
         reasons = list(candidate["rejection_reasons"])
+        codes = list(candidate["rejection_codes"])
         if candidate["kind"] != "no_action":
             margin = candidate["objective"]["sulfur_margin_mg_kg"]
             if margin < forecast_rmse:
                 reasons.append(
                     f"запас по сере {margin:.3g} мг/кг меньше backtest-RMSE прогноза "
-                    f"{forecast_rmse:.3g} мг/кг: выигрыш неотличим от ошибки"
+                    f"{forecast_rmse:.3g} мг/кг на худшем горизонте {forecast_rmse_horizon:g} ч: "
+                    "выигрыш неотличим от ошибки"
                 )
+                codes.append("insufficient_margin")
             model = candidate["effect_model"]
             if model is not None and model.get("name") == "ridge_telemetry" and not model["beats_persistence"]:
                 reasons.append(
@@ -350,12 +372,15 @@ def propose(
                     f"(RMSE {model['test_rmse']:.4g} против {model['persistence_test_rmse']:.4g}): "
                     "её прогноз серы не является основанием для действия"
                 )
-        if not reliability.regime_admissible and candidate["kind"] != "no_action":
-            reasons.append(
-                f"агент надёжности не считает режим допустимым "
-                f"(severity_index {reliability.severity_index:.3g})"
-            )
+                codes.append("unvalidated_effect_model")
+            if not reliability.regime_admissible:
+                reasons.append(
+                    f"агент надёжности не считает режим допустимым "
+                    f"(severity_index {reliability.severity_index:.3g})"
+                )
+                codes.append("regime_inadmissible")
         candidate["rejection_reasons"] = reasons
+        candidate["rejection_codes"] = codes
         candidate["admissible"] = not reasons
 
     admissible = [item for item in candidates if item["admissible"]]
@@ -406,6 +431,13 @@ def build_submission(
         if quality.forecast
         else None
     )
+    # Оркестратор получает тот же порог, каким пользовался оптимизатор:
+    # худший горизонт действия, а не ближайший (см. ADR-010).
+    worst = (
+        max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"])
+        if quality.forecast
+        else None
+    )
     return {
         "input": {
             "scenario": context.scenario,
@@ -432,7 +464,8 @@ def build_submission(
             "blend_fraction_sum": config.BLEND_FRACTION_SUM,
             "allowed_ranges": reliability.allowed_ranges,
             "allowed_ranges_basis": reliability.allowed_ranges_basis,
-            "forecast_backtest_rmse_mg_kg": None if baseline is None else baseline["backtest_rmse_mg_kg"],
+            "forecast_backtest_rmse_mg_kg": None if worst is None else worst["backtest_rmse_mg_kg"],
+            "forecast_backtest_rmse_horizon_hours": None if worst is None else worst["horizon_hours"],
             "quality_risk_exceed_spec": None if baseline is None else baseline["risk_exceed_spec"],
             "regime_admissible": reliability.regime_admissible,
         },

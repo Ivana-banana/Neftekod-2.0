@@ -274,6 +274,57 @@ class TestOptimization:
             expected = "backtested" if candidate["kind"] == "no_action" else "simulated_unvalidated"
             assert candidate["recommendation"]["evidence_type"] == expected, candidate["id"]
 
+    def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
+        """Порог действия берётся по худшему горизонту, на который оно влияет."""
+        backtest = {
+            0.0: BACKTEST[0.0],
+            3.0: {
+                "persistence": BACKTEST[0.0]["persistence"] | {"rmse": 9.5},
+                "ridge_telemetry": BACKTEST[0.0]["ridge_telemetry"],
+            },
+        }
+        context = _context(backtest=backtest)
+        proposal = self._proposal(context)
+        blend = next(item for item in proposal.candidates if item["kind"] == "blend")
+        assert any("9.5" in reason for reason in blend["rejection_reasons"])
+        assert not any("2.6 мг/кг" in reason for reason in blend["rejection_reasons"])
+
+    def test_rejection_reasons_are_machine_readable(self, scenario_context):
+        """UI и тест не должны разбирать причину отклонения по подстроке."""
+        proposal = self._proposal(scenario_context)
+        rejected = [item for item in proposal.candidates if not item["admissible"]]
+        assert rejected
+        for candidate in rejected:
+            assert candidate["rejection_codes"], candidate["id"]
+            assert set(candidate["rejection_codes"]) <= set(optimization.REJECTION_CODES)
+            assert len(candidate["rejection_codes"]) == len(candidate["rejection_reasons"])
+        blend = next(item for item in rejected if item["kind"] == "blend")
+        assert "hard_constraint" in blend["rejection_codes"]
+
+    def test_setpoint_rejected_when_effect_model_loses_to_persistence(self, scenario_context):
+        """Модель эффекта, проигравшая backtest, не даёт права на действие."""
+        losing = optimization.EffectModel(
+            name="ridge_telemetry",
+            horizon_hours=0.0,
+            alpha=100.0,
+            telemetry_lag_hours=0.0,
+            sensitivity={tag: 0.0 for tag in features.TELEMETRY_TAGS},
+            test_rmse=168.2,
+            persistence_test_rmse=2.6,
+        )
+        assert losing.beats_persistence is False
+        proposal = optimization.propose(
+            scenario_context,
+            quality.assess(scenario_context),
+            reliability.assess(scenario_context),
+            effect_model=losing,
+        )
+        setpoints = [item for item in proposal.candidates if item["kind"] == "setpoint"]
+        assert setpoints
+        for candidate in setpoints:
+            assert candidate["admissible"] is False
+            assert "unvalidated_effect_model" in candidate["rejection_codes"]
+
     def test_blending_scenario_is_marked_mocked(self, scenario_context):
         proposal = self._proposal(scenario_context)
         assert any("[MOCKED:" in notice for notice in proposal.mock_notices)
