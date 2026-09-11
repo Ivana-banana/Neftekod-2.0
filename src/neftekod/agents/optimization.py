@@ -457,6 +457,12 @@ def build_submission(
             "current_setpoints": {
                 tag: context.snapshot[f"{tag}_value"] for tag in features.TELEMETRY_TAGS
             },
+            # Текущий состав — модельный статус-кво (ADR-004). Оркестратор
+            # определяет по нему «ничего не меняем» по числам, а не по ярлыку.
+            "current_blend_fractions": {
+                blending.base_component: 1.0,
+                blending.cut_component: 0.0,
+            },
         },
         "recommendation": None if recommended is None else recommended["recommendation"],
         "applied_constraints": {

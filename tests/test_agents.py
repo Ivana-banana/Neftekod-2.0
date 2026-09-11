@@ -352,91 +352,187 @@ class TestOptimization:
         assert proposal.refusal is not None
 
 
-def _submission(context) -> dict:
+def _submission(context) -> tuple[dict, dict]:
+    """Пакет для оркестратора и независимые выводы ролей для сверки."""
     quality_assessment = quality.assess(context)
     reliability_assessment = reliability.assess(context)
     proposal = optimization.propose(context, quality_assessment, reliability_assessment)
-    return optimization.build_submission(
+    submission = optimization.build_submission(
         context, quality_assessment, reliability_assessment, proposal
     )
+    sources = {
+        "quality": quality_assessment.to_dict(),
+        "reliability": reliability_assessment.to_dict(),
+        "snapshot": context.snapshot,
+    }
+    return submission, sources
 
 
 class TestOrchestrator:
     def test_approves_reproducible_recommendation(self, scenario_context):
-        decision = orchestrator.review(_submission(scenario_context))
+        submission, sources = _submission(scenario_context)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "approved"
         assert decision.recommendation["action"] == "hold"
         assert all(check["passed"] for check in decision.checks)
 
     def test_high_quality_risk_is_warned_even_when_approved(self, scenario_context):
-        decision = orchestrator.review(_submission(scenario_context))
+        submission, sources = _submission(scenario_context)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.warnings
 
     def test_better_economics_do_not_buy_a_violation(self, scenario_context):
         """Кандидат с лучшей экономикой, но с нарушением ограничения, отклонён."""
-        submission = _submission(scenario_context)
+        submission, sources = _submission(scenario_context)
         submission["recommendation"] = submission["recommendation"] | {
             "action": "adjust_blend",
             "predicted_sulfur_mg_kg": 10.4,
             "evidence_type": "simulated_unvalidated",
             "blend_fractions": {"hydrotreated_diesel": 0.9995, "straight_run_240_350": 0.0005},
-            "expected_cost_saving_pct": 12.0,
         }
-        decision = orchestrator.review(submission)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert decision.recommendation is None
         assert any("sulfur" in reason for reason in decision.rejection_reasons)
 
+    def test_economic_claims_have_no_place_in_the_recommendation(self, scenario_context):
+        """Выигрыш нельзя даже предъявить оркестратору — он его не принимает."""
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"] = submission["recommendation"] | {
+            "expected_cost_saving_pct": 12.0
+        }
+        with pytest.raises(ValueError, match="не принимает поля"):
+            orchestrator.review(submission, sources=sources)
+
     def test_claimed_sulfur_must_survive_independent_recomputation(self, scenario_context):
         """Слово агента оптимизации не заменяет пересчёт по входу."""
-        submission = _submission(scenario_context)
+        submission, sources = _submission(scenario_context)
         submission["recommendation"] = submission["recommendation"] | {
             "action": "adjust_blend",
             "predicted_sulfur_mg_kg": 9.0,
             "evidence_type": "simulated_unvalidated",
             "blend_fractions": {"hydrotreated_diesel": 0.99, "straight_run_240_350": 0.01},
         }
-        decision = orchestrator.review(submission)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert any("не совпадает с пересчитанной" in reason for reason in decision.rejection_reasons)
         check = next(item for item in decision.checks if item["check"] == "blend_sulfur_recomputed")
         assert check["passed"] is False
 
     def test_agent_cannot_widen_its_own_ranges(self, scenario_context):
-        submission = _submission(scenario_context)
+        submission, sources = _submission(scenario_context)
         widened = {tag: [-1e9, 1e9] for tag in features.TELEMETRY_TAGS}
         submission["recommendation"] = submission["recommendation"] | {"allowed_ranges": widened}
-        decision = orchestrator.review(submission)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert any("диапазоны" in reason for reason in decision.rejection_reasons)
 
     def test_setpoint_outside_applied_range_is_rejected(self, scenario_context):
-        submission = _submission(scenario_context)
+        submission, sources = _submission(scenario_context)
         setpoints = dict(submission["recommendation"]["setpoints"])
         setpoints["T11"] = 10_000.0
         submission["recommendation"] = submission["recommendation"] | {
             "action": "adjust_setpoint",
             "setpoints": setpoints,
         }
-        decision = orchestrator.review(submission)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert any("вне применённого диапазона" in reason for reason in decision.rejection_reasons)
 
     def test_no_admissible_option_gives_explicit_refusal(self):
         context = _context(long_format=_long_format(last_sample="2026-01-30 10:00:00"))
-        decision = orchestrator.review(_submission(context))
+        submission, sources = _submission(context)
+        decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "no_admissible_recommendation"
         assert decision.recommendation is None
         assert decision.rejection_reasons
         assert "Допустимой рекомендации нет" in decision.explanation
 
-    def test_reasoning_of_executors_is_not_accepted(self, scenario_context):
-        """Оркестратор — ревьюер, а не читатель чужих обоснований."""
-        submission = _submission(scenario_context) | {
-            "candidates": [{"id": "hold", "why": "мне кажется, так лучше"}]
+    def test_ranges_widened_consistently_in_both_places_are_caught(self, scenario_context):
+        """Согласованная ложь — не «две сверенные копии», а одна подделка."""
+        submission, sources = _submission(scenario_context)
+        widened = {tag: [200.0, 500.0] for tag in features.TELEMETRY_TAGS}
+        setpoints = dict(submission["recommendation"]["setpoints"]) | {"T11": 480.0}
+        submission["recommendation"] = submission["recommendation"] | {
+            "action": "adjust_setpoint",
+            "allowed_ranges": widened,
+            "setpoints": setpoints,
+        }
+        submission["applied_constraints"] = submission["applied_constraints"] | {
+            "allowed_ranges": widened
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("агент надёжности" in reason for reason in decision.rejection_reasons)
+
+    def test_component_sulfur_must_match_the_quality_agent(self, scenario_context):
+        """Пересчёт баланса не спасает, если занижено само число во входе."""
+        submission, sources = _submission(scenario_context)
+        components = {
+            name: dict(item) for name, item in submission["input"]["components"].items()
+        }
+        base = "hydrotreated_diesel"
+        components[base]["sulfur_mg_kg"] = 3.0
+        submission["input"] = submission["input"] | {"components": components}
+        submission["recommendation"] = submission["recommendation"] | {
+            "predicted_sulfur_mg_kg": 3.0
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("агента качества" in reason for reason in decision.rejection_reasons)
+
+    def test_hold_that_changes_setpoints_is_not_a_hold(self, scenario_context):
+        """Ярлык «hold» не должен отключать проверки, положенные действию."""
+        submission, sources = _submission(scenario_context)
+        setpoints = dict(submission["recommendation"]["setpoints"])
+        setpoints["T11"] = float(sources["snapshot"]["T11_value"]) - 5.0
+        submission["recommendation"] = submission["recommendation"] | {
+            "action": "hold",
+            "setpoints": setpoints,
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("не является сохранением режима" in reason for reason in decision.rejection_reasons)
+
+    def test_quality_risk_cannot_be_softened_in_the_package(self, scenario_context):
+        """Снять предупреждение подменой одного поля нельзя."""
+        submission, sources = _submission(scenario_context)
+        submission["applied_constraints"] = submission["applied_constraints"] | {
+            "quality_risk_exceed_spec": "low",
+            "forecast_backtest_rmse_mg_kg": 0.01,
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("агента качества" in reason for reason in decision.rejection_reasons)
+
+    def test_nested_reasoning_is_rejected_too(self, scenario_context):
+        """Плоского allowlist мало: обоснование пролезало внутрь рекомендации."""
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"] = submission["recommendation"] | {
+            "rationale": "я перебрал 10 кандидатов, hold лучший по экономике"
         }
         with pytest.raises(ValueError, match="не принимает поля"):
+            orchestrator.review(submission, sources=sources)
+
+    def test_sources_are_required_for_a_verdict(self, scenario_context):
+        """Без независимых выводов ролей воспроизвести ограничения нечем."""
+        submission, _ = _submission(scenario_context)
+        with pytest.raises(TypeError):
             orchestrator.review(submission)
+
+    def test_limits_of_the_review_are_stated(self, scenario_context):
+        """Чего проверка не доказывает — часть вывода, а не устная оговорка."""
+        submission, sources = _submission(scenario_context)
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.limits
+        assert any("прогноз" in item for item in decision.limits)
+
+    def test_reasoning_of_executors_is_not_accepted(self, scenario_context):
+        """Оркестратор — ревьюер, а не читатель чужих обоснований."""
+        submission, sources = _submission(scenario_context)
+        leaky = submission | {"candidates": [{"id": "hold", "why": "мне кажется, так лучше"}]}
+        with pytest.raises(ValueError, match="не принимает поля"):
+            orchestrator.review(leaky, sources=sources)
 
 
 class TestReport:

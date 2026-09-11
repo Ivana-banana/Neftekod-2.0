@@ -112,6 +112,8 @@ def _recommendation_markdown(decision, quality, reliability, proposal) -> str:
         if candidate["id"] == proposal.recommended_id:
             continue
         lines.append(f"- `{candidate['id']}` — " + "; ".join(candidate["rejection_reasons"]))
+    lines += ["", "## Чего проверка не доказывает", ""]
+    lines += [f"- {limit}" for limit in decision.limits]
     lines += ["", "## Оговорки", ""]
     lines += [f"- {notice}" for notice in proposal.mock_notices]
     lines += [
@@ -186,7 +188,16 @@ def main(argv: list[str] | None = None) -> int:
     submission = optimization.build_submission(
         scenario_context, quality, reliability, proposal, blending=blending
     )
-    decision = orchestrator.review(submission)
+    # Оркестратор сверяет пакет с выводами ролей, собранными независимо от
+    # агента оптимизации, а не с копиями внутри пакета (ADR-010).
+    decision = orchestrator.review(
+        submission,
+        sources={
+            "quality": quality.to_dict(),
+            "reliability": reliability.to_dict(),
+            "snapshot": scenario_context.snapshot,
+        },
+    )
     log.info("оркестратор: %s", decision.verdict)
 
     scenario_input = {
