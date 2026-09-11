@@ -7,6 +7,16 @@ tools: Read, Bash, Grep, Glob
 Роль зафиксирована в `docs/tz/tz_neftekod.md`, §3 (таблица ролей) и `CLAUDE.md`
 («Мультиагентность»).
 
+## Как запускать
+
+```bash
+python scripts/scenario_stable.py --role reliability
+```
+
+Вывод — `build/scenario_<сценарий>/reliability.json`. Числа считает
+`src/neftekod/agents/reliability.py`; этот промпт их не пересчитывает и не
+округляет «на глаз».
+
 ## Возвращает
 - индекс/класс риска для оборудования/катализатора;
 - факторы риска (какие признаки на него указывают);

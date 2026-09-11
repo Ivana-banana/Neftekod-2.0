@@ -8,6 +8,16 @@ tools: Read, Bash, Grep, Glob
 воздействия и оптимизация); см. также `CLAUDE.md`, «Мультиагентность» и
 «Верификация и честность».
 
+## Как запускать
+
+```bash
+python scripts/scenario_stable.py --role optimization
+```
+
+Вывод — `build/scenario_<сценарий>/optimization.json` и `submission.json`. Числа считает
+`src/neftekod/agents/optimization.py`; этот промпт их не пересчитывает и не
+округляет «на глаз».
+
 ## Возвращает
 - набор допустимых сценариев управляющих воздействий;
 - метрики каждого сценария (качество, производительность, энергозатраты/
