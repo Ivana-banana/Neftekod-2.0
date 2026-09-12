@@ -41,6 +41,7 @@ REJECTION_CODES = (
     "insufficient_margin",
     "unvalidated_effect_model",
     "regime_inadmissible",
+    "anomalous_input",
 )
 
 
@@ -285,6 +286,9 @@ def propose(
         "(0–3 ч), а не на ближайшем: иначе выигрыш лежит внутри ошибки. "
         "Сохранение текущего режима от этого требования освобождено — это не "
         "действие, а статус-кво.",
+        "Если контроль качества входа пометил последний анализ как аномальный "
+        "(ADR-014), действия не рекомендуются вовсе: сохранение режима остаётся "
+        "допустимым, а менять режим по подозрительному измерению нельзя.",
         "Кандидат, эффект которого предсказан моделью, не выигравшей у "
         "выбранного baseline прогноза на отложенной истории, отклоняется: его "
         "прогноз серы не является основанием для действия.",
@@ -501,6 +505,14 @@ def propose(
                     f"(severity_index {reliability.severity_index:.3g})"
                 )
                 codes.append("regime_inadmissible")
+            if (quality.input_anomaly or {}).get("anomalous"):
+                detail = "; ".join(
+                    item["detail"] for item in quality.input_anomaly.get("flags", [])
+                )
+                reasons.append(
+                    f"контроль качества входа пометил последний анализ как аномальный: {detail}"
+                )
+                codes.append("anomalous_input")
         candidate["rejection_reasons"] = reasons
         candidate["rejection_codes"] = codes
         candidate["admissible"] = not reasons

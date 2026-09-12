@@ -86,6 +86,15 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
 
 def _risk_block(decision, quality, reliability, proposal) -> list[str]:
     lines = []
+    anomaly = quality.input_anomaly or {}
+    if anomaly.get("anomalous"):
+        band = anomaly.get("training_band") or []
+        lines.append(
+            "- **Контроль качества входа: последний анализ помечен как аномальный** "
+            + "; ".join(item["detail"] for item in anomaly.get("flags", []))
+            + (f" (полоса обучения {band[0]:g}–{band[1]:g} мг/кг)" if len(band) == 2 else "")
+            + ". Действия на таком измерении не рекомендуются (ADR-014)."
+        )
     if quality.refusal:
         lines.append(f"- Агент качества отказался от прогноза: {quality.refusal['reason']}.")
     else:
@@ -238,6 +247,15 @@ def _confidence_block(quality, proposal) -> list[str]:
             + ", ".join(unconfirmed)
             + " (ADR-007). Свежесть сигнала доверия к его смыслу не добавляет."
         )
+    anomaly = quality.input_anomaly or {}
+    if anomaly.get("value") is not None and not anomaly.get("anomalous"):
+        band = anomaly.get("training_band") or []
+        if len(band) == 2:
+            lines.append(
+                f"- Контроль качества входа пройден: последний анализ "
+                f"{anomaly['value']:g} мг/кг внутри полосы обучения "
+                f"{band[0]:g}–{band[1]:g} мг/кг (ADR-014)."
+            )
     blending = proposal.blending_inputs or {}
     if blending.get("value_mg_kg") is not None:
         lines.append(

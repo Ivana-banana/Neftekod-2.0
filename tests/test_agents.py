@@ -19,6 +19,9 @@ from neftekod.agents import optimization, orchestrator, quality, reliability, re
 
 ISSUE_TIME = pd.Timestamp("2026-02-04 12:00:00")
 WINDOW_START = pd.Timestamp("2026-01-29 00:00:00")
+# Широкая обучающая полоса — как на реальных данных (p01–p99 = 2.68…15.72):
+# на узкой синтетической полосе любой чистый вход считался бы аномальным.
+WIDE_HISTORY = (3.0, 5.0, 8.0, 9.0, 12.0, 15.0)
 
 BACKTEST = {
     0.0: {
@@ -83,6 +86,7 @@ def _long_format(
     last_sample: str = "2026-02-03 10:00:00",
     feed_sulfur_percent: float | None = 0.95,
     feed_sample: str = "2026-02-01 10:00:00",
+    history_values: tuple[float, ...] = (8.0, 8.2, 8.4, 8.6, 8.8),
 ) -> pd.DataFrame:
     """ЛИМС «Гидроочистка.2», ПАК и сера сырья с корректным временем доступности."""
     history = pd.date_range("2024-01-01 10:00", "2025-12-01 10:00", freq="1D")
@@ -92,7 +96,7 @@ def _long_format(
             "available_at": stamp + pd.Timedelta(hours=config.LIMS_PUBLICATION_DELAY_HOURS),
             "source": "lims",
             "tag": features.TARGET_TAG,
-            "value": 8.0 + (index % 5) * 0.2,
+            "value": history_values[index % len(history_values)],
         }
         for index, stamp in enumerate(history)
     ]
@@ -427,13 +431,22 @@ class TestOptimization:
             assert "hard_constraint" in candidate["rejection_codes"], candidate["id"]
 
     def test_cheaper_blend_is_recommended_when_the_margin_covers_the_forecast_error(self):
-        """Экономика решает только между допустимыми вариантами, но решает.
+        """Экономика решает между допустимыми вариантами — когда прогноз точен.
 
-        Запас должен покрывать ошибку прогноза, поэтому вход здесь заведомо
-        чистый. На реальном test-периоде такого запаса внутри полосы p05–p95
-        не встречается ни разу — см. ADR-013.
+        Порог допустимости действия — запас не меньше backtest-RMSE, поэтому
+        механизм оживает только при достаточно точном прогнозе. Здесь RMSE
+        задана 0.5 мг/кг вместо реальных 2.409: на реальных данных такого
+        запаса внутри полосы p05–p95 не встречается ни разу (ADR-013), и это
+        записано как результат, а не обойдено подкруткой порога.
         """
-        context = _context(long_format=_long_format(sulfur=0.5))
+        accurate = {
+            0.0: {
+                "shrunk_persistence": BACKTEST[0.0]["shrunk_persistence"] | {"rmse": 0.5},
+                "persistence": BACKTEST[0.0]["persistence"],
+                "ridge_telemetry": BACKTEST[0.0]["ridge_telemetry"],
+            }
+        }
+        context = _context(backtest=accurate)
         proposal = optimization.propose(
             context, quality.assess(context), reliability.assess(context)
         )
@@ -442,7 +455,7 @@ class TestOptimization:
         assert recommended["objective"]["cut_component_share"] > (
             optimization.BlendingScenario().current_cut_fraction
         )
-        assert recommended["objective"]["sulfur_margin_mg_kg"] >= 2.6  # backtest-RMSE фикстуры
+        assert recommended["objective"]["sulfur_margin_mg_kg"] >= 0.5  # backtest-RMSE фикстуры
 
     def test_missing_feed_analysis_stops_blending(self):
         """Без анализа серы компонента состав смеси не определён — отказ."""

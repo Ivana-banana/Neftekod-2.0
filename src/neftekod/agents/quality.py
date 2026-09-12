@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .. import config
+from .. import anomaly, config
 from .context import TRAINING_FEATURES, ScenarioContext
 
 BASELINE_MODEL = "shrunk_persistence"
@@ -34,6 +34,7 @@ class QualityAssessment:
     training_range: dict
     data_confidence: dict
     assumptions: list
+    input_anomaly: dict = field(default_factory=dict)
     refusal: dict | None = None
     agent: str = field(default="quality", init=False)
 
@@ -46,6 +47,7 @@ class QualityAssessment:
             "in_training_range": self.in_training_range,
             "training_range": self.training_range,
             "data_confidence": self.data_confidence,
+            "input_anomaly": self.input_anomaly,
             "assumptions": self.assumptions,
         }
 
@@ -130,6 +132,9 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         "Классы риска заданы в единицах backtest-RMSE: запас меньше одной RMSE — "
         "high, меньше двух — moderate. Внешнего обоснования у этих границ нет, "
         "это модельный порог сценария (ADR-010).",
+        "Аномальность последнего анализа проверяется отдельно (ADR-014): "
+        "неположительное значение или выход за полосу p01–p99 обучающей выборки "
+        "помечается флагом, и агент оптимизации не строит на нём действий.",
         "Единицы P8/T11/F19 не подтверждены (ADR-007): в data_confidence они "
         "помечены units_confirmed = false, свежесть сигнала доверия к ним не даёт.",
     ]
@@ -137,6 +142,9 @@ def assess(context: ScenarioContext) -> QualityAssessment:
 
     baseline = snapshot.get("lims_value")
     baseline_age = snapshot.get("lims_age_hours")
+    # Контроль качества входа — отдельная названная проверка, а не побочный
+    # эффект перцентильных полос (ADR-014).
+    input_anomaly = anomaly.assess_lab_value(baseline, context.training_stats["lims_value"])
     if snapshot.get("lims_missing") or baseline is None:
         refusal = {
             "reason": "нет опубликованного анализа ЛИМС на момент выдачи",
@@ -149,6 +157,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             training_range=training_range,
             data_confidence=confidence,
             assumptions=assumptions,
+            input_anomaly=input_anomaly,
             refusal=refusal,
         )
     if baseline_age is not None and baseline_age > MAX_BASELINE_AGE_HOURS:
@@ -166,6 +175,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             training_range=training_range,
             data_confidence=confidence,
             assumptions=assumptions,
+            input_anomaly=input_anomaly,
             refusal=refusal,
         )
 
@@ -216,4 +226,5 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         training_range=training_range,
         data_confidence=confidence,
         assumptions=assumptions,
+        input_anomaly=input_anomaly,
     )
