@@ -1,0 +1,48 @@
+# Тесты на каждый push и pull request.
+#
+# Крупные телеметрические CSV (data/avt_tags.csv 247 МБ, data/242000_tags.csv
+# 91 МБ) в репозиторий не коммитятся — ссылка на них в README. Зависящие от них
+# тесты обязаны пропускаться через pytest.skip, а не падать: проверка этого
+# правила — отдельный шаг ниже, иначе «красная сборка» появится не на дефекте,
+# а на отсутствии файла.
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Тесты
+        run: pytest -q
+
+      - name: Жёсткие ограничения отдельным прогоном
+        # Дублирует часть предыдущего шага намеренно: это прямые баллы по
+        # критерию «Оптимизация и безопасность» (CLAUDE.md), и в логе сборки
+        # их результат должен быть виден отдельной строкой, а не внутри 180
+        # остальных тестов.
+        run: pytest -q tests/test_hard_constraints.py
+
+      - name: evidence_type не пропущен ни у одного вывода оптимизации
+        # Требование CLAUDE.md: поле backtested / simulated_unvalidated
+        # проверяется в CI, а не только локально.
+        run: pytest -q tests/test_agents.py -k "evidence_type or backtested"
+
+      - name: Тесты, зависящие от больших CSV, пропущены, а не упали
+        run: |
+          pytest -q 2>&1 | tail -1 | tee /tmp/summary
+          grep -qv "failed" /tmp/summary

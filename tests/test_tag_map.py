@@ -73,6 +73,9 @@ def test_duplicate_description_pairs_disagree_in_telemetry():
     Это не доказательство неверного соответствия тегов: организаторы его
     подтвердили. Единицы и масштабы остаются неуточнёнными.
     """
+    for path in (config.HT_TELEMETRY_CSV, config.AVT_TELEMETRY_CSV):
+        if not path.exists():
+            pytest.skip(f"нет {path} — скачать по ссылке из README")
     telemetry = {
         "24-2000": pd.read_csv(config.HT_TELEMETRY_CSV),
         "АВТ": pd.read_csv(config.AVT_TELEMETRY_CSV),
