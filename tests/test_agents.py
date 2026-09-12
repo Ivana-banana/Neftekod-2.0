@@ -22,12 +22,29 @@ WINDOW_START = pd.Timestamp("2026-01-29 00:00:00")
 
 BACKTEST = {
     0.0: {
+        # Выбранный baseline — сдвинутый persistence (ADR-012): прогноз =
+        # shrinkage · последний анализ + (1 − shrinkage) · уровень обучения.
+        "shrunk_persistence": {
+            "n": 253,
+            "mae": 1.53,
+            "rmse": 2.6,
+            "r2": 0.13,
+            "medae": 0.9,
+            "evidence_type": "backtested",
+            "baseline_shrinkage": 0.3,
+            "baseline_level_mg_kg": 8.6,
+            "alpha": None,
+            "telemetry_lag_hours": None,
+        },
         "persistence": {
             "n": 253,
             "mae": 1.8,
             "rmse": 2.6,
             "r2": -0.13,
+            "medae": 1.2,
             "evidence_type": "backtested",
+            "baseline_shrinkage": None,
+            "baseline_level_mg_kg": None,
             "alpha": None,
             "telemetry_lag_hours": None,
         },
@@ -36,7 +53,10 @@ BACKTEST = {
             "mae": 25.4,
             "rmse": 168.2,
             "r2": -4665.9,
+            "medae": 4.2,
             "evidence_type": "backtested",
+            "baseline_shrinkage": None,
+            "baseline_level_mg_kg": None,
             "alpha": 100.0,
             "telemetry_lag_hours": 0.0,
         },
@@ -143,16 +163,34 @@ class TestContext:
 
 
 class TestQuality:
-    def test_forecast_is_backtested_persistence(self, scenario_context):
+    def test_forecast_is_the_backtested_shrunk_baseline(self, scenario_context):
         assessment = quality.assess(scenario_context)
         assert assessment.refusal is None
         assert [item["evidence_type"] for item in assessment.forecast] == ["backtested"]
-        assert assessment.forecast[0]["predicted_sulfur_mg_kg"] == pytest.approx(8.4)
+        item = assessment.forecast[0]
+        # 0.3 · 8.4 + 0.7 · 8.6: прогноз воспроизводится по параметрам backtest,
+        # а не подбирается внутри сценария (ADR-012).
+        assert item["predicted_sulfur_mg_kg"] == pytest.approx(8.54)
+        assert item["last_published_sulfur_mg_kg"] == pytest.approx(8.4)
+        assert item["model"] == "shrunk_persistence"
+
+    def test_forecast_without_baseline_parameters_is_an_error(self, scenario_context):
+        """Без параметров выбранного baseline прогноз не выдумывается."""
+        broken = {
+            0.0: {
+                "shrunk_persistence": BACKTEST[0.0]["shrunk_persistence"]
+                | {"baseline_shrinkage": None},
+                "ridge_telemetry": BACKTEST[0.0]["ridge_telemetry"],
+            }
+        }
+        context = dataclasses.replace(scenario_context, backtest=broken)
+        with pytest.raises(ValueError, match="нет параметров baseline"):
+            quality.assess(context)
 
     def test_risk_is_high_when_margin_below_one_rmse(self, scenario_context):
         assessment = quality.assess(scenario_context)
         item = assessment.forecast[0]
-        assert item["margin_mg_kg"] == pytest.approx(1.6)
+        assert item["margin_mg_kg"] == pytest.approx(1.46)
         assert item["risk_exceed_spec"] == "high"
 
     def test_out_of_training_range_is_flagged(self):
@@ -279,6 +317,7 @@ class TestOptimization:
         backtest = {
             0.0: BACKTEST[0.0],
             3.0: {
+                "shrunk_persistence": BACKTEST[0.0]["shrunk_persistence"] | {"rmse": 9.5},
                 "persistence": BACKTEST[0.0]["persistence"] | {"rmse": 9.5},
                 "ridge_telemetry": BACKTEST[0.0]["ridge_telemetry"],
             },
@@ -301,7 +340,7 @@ class TestOptimization:
         blend = next(item for item in rejected if item["kind"] == "blend")
         assert "hard_constraint" in blend["rejection_codes"]
 
-    def test_setpoint_rejected_when_effect_model_loses_to_persistence(self, scenario_context):
+    def test_setpoint_rejected_when_effect_model_loses_to_baseline(self, scenario_context):
         """Модель эффекта, проигравшая backtest, не даёт права на действие."""
         losing = optimization.EffectModel(
             name="ridge_telemetry",
@@ -310,9 +349,10 @@ class TestOptimization:
             telemetry_lag_hours=0.0,
             sensitivity={tag: 0.0 for tag in features.TELEMETRY_TAGS},
             test_rmse=168.2,
-            persistence_test_rmse=2.6,
+            baseline_model="shrunk_persistence",
+            baseline_test_rmse=2.6,
         )
-        assert losing.beats_persistence is False
+        assert losing.beats_baseline is False
         proposal = optimization.propose(
             scenario_context,
             quality.assess(scenario_context),

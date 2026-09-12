@@ -4,10 +4,12 @@
 Агент не принимает решений об управляющих воздействиях и не смягчает порог
 серы: он выдаёт прогноз, его проверенную историей ошибку и риск нарушения.
 
-Прогноз — persistence (последний опубликованный анализ). Это не «за
-неимением лучшего»: на отложенной по времени истории persistence выигрывает
-у телеметрической Ridge (test RMSE 2.62 против 168.2, см. build/forecast_report.md
-и ADR-008), поэтому именно он несёт evidence_type: backtested.
+Прогноз — сдвинутый persistence: shrinkage · последний опубликованный анализ
+ЛИМС + (1 − shrinkage) · уровень обучающей выборки. Доля shrinkage выбрана
+только на valid (ADR-012); persistence (shrinkage = 1) и константа
+(shrinkage = 0) входят в то же семейство и проиграли ей на отложенной
+истории (test RMSE 2.296 против 2.620 и 2.483 при h = 0). Именно этот прогноз
+несёт evidence_type: backtested.
 """
 
 from __future__ import annotations
@@ -17,9 +19,9 @@ from dataclasses import dataclass, field
 from .. import config
 from .context import TRAINING_FEATURES, ScenarioContext
 
-BASELINE_MODEL = "persistence"
+BASELINE_MODEL = "shrunk_persistence"
 # Отбор ЛИМС суточный (10:00), публикация +4 ч. Анализ старше 48 часов
-# означает, что как минимум одна проба пропущена: persistence на таком
+# означает, что как минимум одна проба пропущена: прогноз на таком
 # основании не выдаётся. Модельное допущение сценария — см. ADR-010.
 MAX_BASELINE_AGE_HOURS = 48.0
 
@@ -115,8 +117,10 @@ def assess(context: ScenarioContext) -> QualityAssessment:
     training_range = _training_range(context)
     confidence = _data_confidence(context)
     assumptions = [
-        "Прогноз серы — persistence: последний опубликованный анализ ЛИМС "
-        "«Гидроочистка.2». Выбран по backtest (ADR-008), не по удобству.",
+        "Прогноз серы — сдвинутый persistence: shrinkage · последний "
+        "опубликованный анализ ЛИМС «Гидроочистка.2» + (1 − shrinkage) · уровень "
+        "обучающей выборки. Доля shrinkage отобрана на valid (ADR-012), не по "
+        "удобству; persistence и константа входят в то же семейство и проиграли.",
         f"Анализ старше {MAX_BASELINE_AGE_HOURS:g} ч не используется как основание "
         "прогноза: суточный отбор ЛИМС + публикация 4 ч. Допущение сценария.",
         "«Вне диапазона обучения» решается по p01–p99 обучающей выборки: "
@@ -153,7 +157,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
                 f"последний анализ ЛИМС старше {MAX_BASELINE_AGE_HOURS:g} ч "
                 f"(возраст {baseline_age:.1f} ч)"
             ),
-            "rule": "persistence на устаревшем анализе не является обоснованным прогнозом",
+            "rule": "прогноз на устаревшем анализе не является обоснованным прогнозом",
         }
         return QualityAssessment(
             issue_time=str(context.issue_time),
@@ -170,16 +174,30 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         metrics = context.backtest[horizon].get(BASELINE_MODEL)
         if metrics is None:
             continue
-        margin = config.SULFUR_LIMIT_MG_KG - baseline
+        shrinkage = metrics.get("baseline_shrinkage")
+        level = metrics.get("baseline_level_mg_kg")
+        if shrinkage is None or level is None:
+            raise ValueError(
+                f"в backtest нет параметров baseline {BASELINE_MODEL}: "
+                "пересоберите build/forecast_report.csv"
+            )
+        # Прогноз воспроизводится по параметрам, выбранным в backtest, и не
+        # подбирается заново внутри сценария (ADR-012).
+        predicted = shrinkage * baseline + (1.0 - shrinkage) * level
+        margin = config.SULFUR_LIMIT_MG_KG - predicted
         forecast.append(
             {
                 "horizon_hours": horizon,
                 "model": BASELINE_MODEL,
-                "predicted_sulfur_mg_kg": baseline,
+                "baseline_shrinkage": shrinkage,
+                "baseline_level_mg_kg": level,
+                "last_published_sulfur_mg_kg": baseline,
+                "predicted_sulfur_mg_kg": predicted,
                 "spec_limit_mg_kg": config.SULFUR_LIMIT_MG_KG,
                 "margin_mg_kg": margin,
                 "backtest_rmse_mg_kg": metrics["rmse"],
                 "backtest_mae_mg_kg": metrics["mae"],
+                "backtest_medae_mg_kg": metrics["medae"],
                 "backtest_n": metrics["n"],
                 "margin_in_rmse": margin / metrics["rmse"],
                 "risk_exceed_spec": _risk(margin, metrics["rmse"]),
@@ -188,7 +206,9 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             }
         )
     if not forecast:
-        raise ValueError("в backtest нет строк persistence: пересоберите build/forecast_report.csv")
+        raise ValueError(
+            f"в backtest нет строк {BASELINE_MODEL}: пересоберите build/forecast_report.csv"
+        )
     return QualityAssessment(
         issue_time=str(context.issue_time),
         forecast=forecast,

@@ -1,9 +1,10 @@
 """Проверки прогноза с доступностью источников и временным split."""
 
+import numpy as np
 import pandas as pd
 import pytest
 
-from neftekod import forecast
+from neftekod import config, forecast
 
 
 def _observations():
@@ -138,7 +139,7 @@ def test_evaluate_forecasts_labels_backtest_and_keeps_train_valid_test_separate(
     report = forecast.evaluate_forecasts(pd.DataFrame(rows), horizons=(0, 1))
 
     assert set(report["split"]) == {"fit", "valid", "test"}
-    assert set(report["model"]) == {"persistence", "ridge"}
+    assert set(report["model"]) == {"persistence", "shrunk_persistence", "ridge"}
     assert set(report["evidence_type"]) == {"backtested"}
     assert set(report["horizon_hours"]) == {0, 1}
     assert (report["n"] > 0).all()
@@ -189,3 +190,61 @@ def test_telemetry_evaluation_reports_all_candidate_lags_but_scores_one_on_test(
     assert ridge[ridge["split"] == "test"]["selected"].eq(True).all()
     assert report["evidence_type"].eq("backtested").all()
     assert {"lims_age_hours_median", "pak_age_hours_median", "P8_age_hours_median"} <= set(report)
+
+
+def _baseline_frame(values: list[float], start: str = "2023-01-01") -> pd.DataFrame:
+    """Кадр цели/baseline с суточным шагом; split по времени как в ADR-006."""
+    stamps = pd.date_range(start, periods=len(values), freq="D")
+    return pd.DataFrame(
+        {
+            "target_time": stamps,
+            "issue_time": stamps,
+            "target_value": values,
+            "baseline_prediction": [values[0]] + values[:-1],
+            "baseline_age_hours": 24.0,
+            "pak_age_hours": 24.0,
+            "pak_missing": False,
+        }
+    )
+
+
+def test_shrinkage_is_selected_on_valid_and_prefers_the_fresh_analysis_when_it_helps():
+    """Если последний анализ действительно предсказывает следующий — shrinkage 1."""
+    # Монотонный ряд: persistence точен, константа ошибается систематически.
+    frame = _baseline_frame([5.0 + 0.01 * index for index in range(1400)])
+    parts = forecast._split_rows(frame)
+    assert forecast.select_shrinkage(parts["fit"], parts["valid"]) == 1.0
+
+
+def test_shrinkage_is_zero_when_the_fresh_analysis_is_pure_noise():
+    """Шум вокруг уровня: свежий анализ не помогает, выбирается константа."""
+    generator = np.random.default_rng(0)
+    values = list(8.5 + generator.normal(0.0, 2.0, 1400))
+    frame = _baseline_frame(values)
+    parts = forecast._split_rows(frame)
+    assert forecast.select_shrinkage(parts["fit"], parts["valid"]) <= 0.3
+
+
+def test_test_split_never_participates_in_shrinkage_selection():
+    """Подмена test не меняет выбор: отбор идёт только на fit/valid."""
+    values = [5.0 + 0.01 * index for index in range(1400)]
+    frame = _baseline_frame(values)
+    parts = forecast._split_rows(frame)
+    chosen = forecast.select_shrinkage(parts["fit"], parts["valid"])
+    broken_test = frame.copy()
+    mask = pd.to_datetime(broken_test["target_time"]) >= pd.Timestamp(config.TEST_START)
+    broken_test.loc[mask, "target_value"] = 1000.0
+    parts_broken = forecast._split_rows(broken_test)
+    assert forecast.select_shrinkage(parts_broken["fit"], parts_broken["valid"]) == chosen
+
+
+def test_report_carries_baseline_parameters_needed_to_reproduce_the_forecast():
+    values = [8.0 + 0.5 * ((index % 5) - 2) for index in range(1400)]
+    frame = _baseline_frame(values)
+    rows = forecast._shrunk_baseline_rows(0.0, forecast._split_rows(frame))
+    report = pd.DataFrame(rows)
+    test_rows = report[report["split"].eq("test")]
+    assert len(test_rows) == 1, "на test оценивается ровно один выбранный вариант"
+    assert bool(test_rows.iloc[0]["selected"]) is True
+    assert test_rows.iloc[0]["baseline_level_mg_kg"] > 0
+    assert report[report["split"].eq("valid")]["selected"].sum() == 1

@@ -25,6 +25,7 @@ import pandas as pd
 
 from .. import config, constraints, features, forecast
 from .context import ScenarioContext
+from . import quality as quality_module
 from .quality import QualityAssessment
 from .reliability import ReliabilityAssessment
 
@@ -76,11 +77,18 @@ class EffectModel:
     telemetry_lag_hours: float
     sensitivity: dict
     test_rmse: float
-    persistence_test_rmse: float
+    baseline_model: str
+    baseline_test_rmse: float
 
     @property
-    def beats_persistence(self) -> bool:
-        return self.test_rmse < self.persistence_test_rmse
+    def beats_baseline(self) -> bool:
+        """Выигрывает ли модель эффекта у выбранного baseline (ADR-010, §3).
+
+        Сравнение идёт с тем baseline, который отобран на valid и используется
+        агентом качества (ADR-012), а не с persistence: иначе действие могло бы
+        пройти, проигрывая прогнозу, на котором стоит вся оценка риска.
+        """
+        return self.test_rmse < self.baseline_test_rmse
 
     def to_dict(self) -> dict:
         return {
@@ -90,8 +98,9 @@ class EffectModel:
             "telemetry_lag_hours": self.telemetry_lag_hours,
             "sensitivity_mg_kg_per_unit": self.sensitivity,
             "test_rmse": self.test_rmse,
-            "persistence_test_rmse": self.persistence_test_rmse,
-            "beats_persistence": self.beats_persistence,
+            "baseline_model": self.baseline_model,
+            "baseline_test_rmse": self.baseline_test_rmse,
+            "beats_baseline": self.beats_baseline,
             "evidence_type": "simulated_unvalidated",
         }
 
@@ -104,7 +113,7 @@ def fit_effect_model(context: ScenarioContext, horizon_hours: float = 0.0) -> Ef
     данных до границы ADR-006 — сценарий стоит в test-периоде.
     """
     metrics = context.backtest[horizon_hours]["ridge_telemetry"]
-    persistence = context.backtest[horizon_hours]["persistence"]
+    baseline = context.backtest[horizon_hours][quality_module.BASELINE_MODEL]
     frame = forecast.build_prediction_frame(
         context.long_format,
         horizon_hours,
@@ -127,7 +136,8 @@ def fit_effect_model(context: ScenarioContext, horizon_hours: float = 0.0) -> Ef
         telemetry_lag_hours=float(metrics["telemetry_lag_hours"]),
         sensitivity=sensitivity,
         test_rmse=float(metrics["rmse"]),
-        persistence_test_rmse=float(persistence["rmse"]),
+        baseline_model=quality_module.BASELINE_MODEL,
+        baseline_test_rmse=float(baseline["rmse"]),
     )
 
 
@@ -213,8 +223,8 @@ def propose(
         "Сохранение текущего режима от этого требования освобождено — это не "
         "действие, а статус-кво.",
         "Кандидат, эффект которого предсказан моделью, не выигравшей у "
-        "persistence на отложенной истории, отклоняется: его прогноз серы не "
-        "является основанием для действия.",
+        "выбранного baseline прогноза на отложенной истории, отклоняется: его "
+        "прогноз серы не является основанием для действия.",
         "Среди допустимых выбирается минимальный стоимостный прокси; при "
         "равенстве остаётся сохранение текущего режима.",
     ]
@@ -366,10 +376,11 @@ def propose(
                 )
                 codes.append("insufficient_margin")
             model = candidate["effect_model"]
-            if model is not None and model.get("name") == "ridge_telemetry" and not model["beats_persistence"]:
+            if model is not None and model.get("name") == "ridge_telemetry" and not model["beats_baseline"]:
                 reasons.append(
-                    f"модель эффекта {model['name']} проиграла persistence на test "
-                    f"(RMSE {model['test_rmse']:.4g} против {model['persistence_test_rmse']:.4g}): "
+                    f"модель эффекта {model['name']} проиграла baseline "
+                    f"{model['baseline_model']} на test "
+                    f"(RMSE {model['test_rmse']:.4g} против {model['baseline_test_rmse']:.4g}): "
                     "её прогноз серы не является основанием для действия"
                 )
                 codes.append("unvalidated_effect_model")
@@ -445,7 +456,7 @@ def build_submission(
             "components": {
                 blending.base_component: {
                     "sulfur_mg_kg": None if baseline is None else baseline["predicted_sulfur_mg_kg"],
-                    "source": "прогноз агента качества (persistence по ЛИМС «Гидроочистка.2»)",
+                    "source": "прогноз агента качества (сдвинутый persistence по ЛИМС «Гидроочистка.2»)",
                     "evidence_type": None if baseline is None else baseline["evidence_type"],
                 },
                 blending.cut_component: {

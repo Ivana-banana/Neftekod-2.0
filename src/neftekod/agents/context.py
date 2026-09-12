@@ -91,6 +91,15 @@ def load_backtest(path=None) -> dict:
             "rmse": float(row["rmse"]),
             "r2": float(row["r2"]),
             "evidence_type": str(row["evidence_type"]),
+            "medae": float(row["medae"]),
+            # Параметры выбранного baseline: агент качества обязан уметь
+            # воспроизвести прогноз, не переобучая ничего (ADR-012).
+            "baseline_shrinkage": (
+                None if pd.isna(row["baseline_shrinkage"]) else float(row["baseline_shrinkage"])
+            ),
+            "baseline_level_mg_kg": (
+                None if pd.isna(row["baseline_level_mg_kg"]) else float(row["baseline_level_mg_kg"])
+            ),
             # Гиперпараметры выбраны в evaluate_forecast на fit/valid; сценарий
             # их не переподбирает, а переиспользует (ADR-008, ADR-009).
             "alpha": None if pd.isna(row["alpha"]) else float(row["alpha"]),

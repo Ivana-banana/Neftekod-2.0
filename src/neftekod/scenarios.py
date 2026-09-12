@@ -152,11 +152,12 @@ def execute(spec: ScenarioSpec, *, blending: optimization.BlendingScenario | Non
     )
     effect_model = optimization.fit_effect_model(scenario_context)
     log.info(
-        "модель эффекта уставок %s: test RMSE %.4g против persistence %.4g — %s",
+        "модель эффекта уставок %s: test RMSE %.4g против baseline %s %.4g — %s",
         effect_model.name,
         effect_model.test_rmse,
-        effect_model.persistence_test_rmse,
-        "выигрывает" if effect_model.beats_persistence else "проигрывает",
+        effect_model.baseline_model,
+        effect_model.baseline_test_rmse,
+        "выигрывает" if effect_model.beats_baseline else "проигрывает",
     )
     proposal = optimization.propose(
         scenario_context, quality, reliability, blending=blending, effect_model=effect_model

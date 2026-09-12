@@ -32,6 +32,14 @@ TELEMETRY_FEATURE_NAMES = tuple(
 DEFAULT_ALPHAS = (0.0, 0.01, 0.1, 1.0, 10.0, 100.0)
 DEFAULT_TELEMETRY_LAGS = (0.0, 1.0, 2.0, 3.0)
 
+# Семейство baseline: прогноз = shrinkage · последний анализ +
+# (1 − shrinkage) · уровень обучающей выборки. shrinkage = 1 — это
+# persistence, shrinkage = 0 — константа. Обе крайние точки входят в сетку,
+# поэтому выбор между ними делается числом на valid, а не на словах.
+# См. ADR-012.
+BASELINE_SHRINKAGE_GRID = (0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0)
+SHRUNK_BASELINE = "shrunk_persistence"
+
 
 @dataclass(frozen=True)
 class _IndexedObservations:
@@ -177,6 +185,48 @@ def build_prediction_frame(
     return result.sort_values("target_time", kind="mergesort").reset_index(drop=True)
 
 
+def shrink_baseline(values, level: float, shrinkage: float):
+    """Прогноз семейства baseline: сдвиг последнего анализа к уровню обучения."""
+    if not 0.0 <= shrinkage <= 1.0:
+        raise ValueError("shrinkage должен лежать в [0, 1]")
+    return shrinkage * pd.to_numeric(values, errors="coerce") + (1.0 - shrinkage) * float(level)
+
+
+def median_absolute_error(actual, predicted) -> float:
+    """Устойчивая метрика отбора: в цели есть выбросы 120 и 2120 мг/кг."""
+    y = np.asarray(pd.to_numeric(actual, errors="coerce"), dtype=float)
+    y_hat = np.asarray(pd.to_numeric(predicted, errors="coerce"), dtype=float)
+    mask = np.isfinite(y) & np.isfinite(y_hat)
+    if not mask.any():
+        raise ValueError("нет числовых пар для оценки")
+    return float(np.median(np.abs(y_hat[mask] - y[mask])))
+
+
+def select_shrinkage(
+    fit: pd.DataFrame,
+    valid: pd.DataFrame,
+    grid: tuple[float, ...] = BASELINE_SHRINKAGE_GRID,
+) -> float:
+    """Выбрать shrinkage на valid по MedAE; при равенстве — большая доля анализа.
+
+    Метрика отбора зафиксирована в ADR-012 до прогона test: MedAE, потому что
+    RMSE на valid определяется единичными выбросами цели. Тай-брейк в пользу
+    большей shrinkage тоже записан там: среди неразличимых вариантов система
+    обязана остаться зависимой от свежего измерения, иначе она не может
+    заметить выход за спецификацию.
+    """
+    if valid.empty:
+        return grid[-1]
+    level = float(fit["target_value"].median())
+    scores = {
+        shrinkage: median_absolute_error(
+            valid["target_value"], shrink_baseline(valid["baseline_prediction"], level, shrinkage)
+        )
+        for shrinkage in grid
+    }
+    return min(scores, key=lambda shrinkage: (scores[shrinkage], -shrinkage))
+
+
 def score_predictions(actual: pd.Series, predicted: pd.Series) -> dict[str, float | int]:
     """MAE, RMSE и R² для пар числовых наблюдений."""
     y = np.asarray(pd.to_numeric(actual, errors="coerce"), dtype=float)
@@ -309,6 +359,8 @@ def _metric_row(
     alpha: float | None = None,
     telemetry_lag_hours: float | None = None,
     selected: bool | None = None,
+    baseline_shrinkage: float | None = None,
+    baseline_level_mg_kg: float | None = None,
 ) -> dict:
     metrics = score_predictions(rows["target_value"], predicted)
     telemetry_ages = {
@@ -330,8 +382,11 @@ def _metric_row(
         "alpha": alpha,
         "telemetry_lag_hours": telemetry_lag_hours,
         "selected": selected,
+        "baseline_shrinkage": baseline_shrinkage,
+        "baseline_level_mg_kg": baseline_level_mg_kg,
         "evidence_type": "backtested",
         **metrics,
+        "medae": median_absolute_error(rows["target_value"], predicted),
         "lims_age_hours_median": float(rows["baseline_age_hours"].median()),
         "baseline_age_hours_median": float(rows["baseline_age_hours"].median()),
         "pak_age_hours_median": float(rows["pak_age_hours"].median()),
@@ -348,11 +403,14 @@ REPORT_COLUMNS = [
     "alpha",
     "telemetry_lag_hours",
     "selected",
+    "baseline_shrinkage",
+    "baseline_level_mg_kg",
     "evidence_type",
     "n",
     "mae",
     "rmse",
     "r2",
+    "medae",
     "lims_age_hours_median",
     "baseline_age_hours_median",
     "pak_age_hours_median",
@@ -360,6 +418,52 @@ REPORT_COLUMNS = [
     *(f"{tag}_age_hours_median" for tag in features.TELEMETRY_TAGS),
     *(f"{tag}_missing_fraction" for tag in features.TELEMETRY_TAGS),
 ]
+
+
+def _shrunk_baseline_rows(horizon: float, parts: dict[str, pd.DataFrame]) -> list[dict]:
+    """Строки семейства baseline: вся сетка на fit/valid, на test — выбранная.
+
+    Уровень на test переоценивается на fit+valid — так же, как дообучается
+    ridge (ADR-008). Сам shrinkage выбирается только на valid (ADR-012).
+    """
+    fit, valid, test = parts["fit"], parts["valid"], parts["test"]
+    if fit.empty:
+        return []
+    level_fit = float(fit["target_value"].median())
+    selected = select_shrinkage(fit, valid)
+    rows: list[dict] = []
+    for split_name in ("fit", "valid"):
+        frame = parts[split_name]
+        if frame.empty:
+            continue
+        for shrinkage in BASELINE_SHRINKAGE_GRID:
+            rows.append(
+                _metric_row(
+                    horizon=horizon,
+                    split_name=split_name,
+                    model_name=SHRUNK_BASELINE,
+                    rows=frame,
+                    predicted=shrink_baseline(frame["baseline_prediction"], level_fit, shrinkage),
+                    selected=shrinkage == selected,
+                    baseline_shrinkage=shrinkage,
+                    baseline_level_mg_kg=level_fit,
+                )
+            )
+    if not test.empty:
+        level_train = float(pd.concat([fit, valid], ignore_index=True)["target_value"].median())
+        rows.append(
+            _metric_row(
+                horizon=horizon,
+                split_name="test",
+                model_name=SHRUNK_BASELINE,
+                rows=test,
+                predicted=shrink_baseline(test["baseline_prediction"], level_train, selected),
+                selected=True,
+                baseline_shrinkage=selected,
+                baseline_level_mg_kg=level_train,
+            )
+        )
+    return rows
 
 
 def _evaluate_without_telemetry(
@@ -388,6 +492,7 @@ def _evaluate_without_telemetry(
                     predicted=rows["baseline_prediction"],
                 )
             )
+        report.extend(_shrunk_baseline_rows(horizon, parts))
 
         fit_rows = parts["fit"]
         if len(fit_rows) < 2:
@@ -483,6 +588,7 @@ def _evaluate_with_telemetry(
                     predicted=rows["baseline_prediction"],
                 )
             )
+        report.extend(_shrunk_baseline_rows(horizon, baseline_parts))
 
         candidates = []
         for lag in telemetry_lags:
