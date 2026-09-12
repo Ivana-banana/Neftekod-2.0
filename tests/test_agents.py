@@ -672,3 +672,39 @@ class TestReport:
         assert '"t": "2026-02-04 12:00:00"' in text
         assert '"missing": null' in text
         assert '"flag": true' in text
+
+
+class TestSubmissionConsistency:
+    """Пакет описывает один момент: риск и ошибка прогноза с одного горизонта."""
+
+    def test_risk_and_rmse_come_from_the_same_worst_horizon(self):
+        # Горизонты с разной ошибкой: на ближайшем запас укладывается в RMSE,
+        # на худшем — нет. Дефект, найденный оркестратором на сценарии 4.
+        backtest = {
+            0.0: BACKTEST[0.0],
+            2.0: {
+                "shrunk_persistence": BACKTEST[0.0]["shrunk_persistence"] | {"rmse": 9.5},
+                "persistence": BACKTEST[0.0]["persistence"] | {"rmse": 9.5},
+                "ridge_telemetry": BACKTEST[0.0]["ridge_telemetry"],
+            },
+        }
+        context = _context(backtest=backtest)
+        quality_assessment = quality.assess(context)
+        reliability_assessment = reliability.assess(context)
+        proposal = optimization.propose(context, quality_assessment, reliability_assessment)
+        submission = optimization.build_submission(
+            context, quality_assessment, reliability_assessment, proposal
+        )
+        applied = submission["applied_constraints"]
+        worst = max(quality_assessment.forecast, key=lambda item: item["backtest_rmse_mg_kg"])
+        assert applied["forecast_backtest_rmse_horizon_hours"] == worst["horizon_hours"]
+        assert applied["quality_risk_exceed_spec"] == worst["risk_exceed_spec"]
+
+    def test_orchestrator_rejects_a_package_mixing_two_horizons(self):
+        """Подмена класса риска на более мягкий не проходит ревью."""
+        context = _context()
+        submission, sources = _submission(context)
+        submission["applied_constraints"]["quality_risk_exceed_spec"] = "moderate"
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("оценка риска" in reason for reason in decision.rejection_reasons)

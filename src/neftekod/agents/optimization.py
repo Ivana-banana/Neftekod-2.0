@@ -600,7 +600,11 @@ def build_submission(
             "allowed_ranges_basis": reliability.allowed_ranges_basis,
             "forecast_backtest_rmse_mg_kg": None if worst is None else worst["backtest_rmse_mg_kg"],
             "forecast_backtest_rmse_horizon_hours": None if worst is None else worst["horizon_hours"],
-            "quality_risk_exceed_spec": None if baseline is None else baseline["risk_exceed_spec"],
+            # Класс риска берётся с того же худшего горизонта, что и порог:
+            # смешивать «риск с ближайшего» и «ошибку с худшего» нельзя —
+            # пакет тогда описывает два разных момента. Дефект найден
+            # оркестратором на сценарии 4 (ADR-010, §3б).
+            "quality_risk_exceed_spec": None if worst is None else worst["risk_exceed_spec"],
             "regime_admissible": reliability.regime_admissible,
         },
         "refusals": {
