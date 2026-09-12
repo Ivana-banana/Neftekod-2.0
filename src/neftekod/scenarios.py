@@ -216,7 +216,12 @@ def write(run: ScenarioRun, *, role: str = "all") -> Path:
     if role == "all":
         (output_dir / "recommendation.md").write_text(
             card.recommendation_markdown(
-                run.spec.title, run.decision, run.quality, run.reliability, run.proposal
+                run.spec.title,
+                run.decision,
+                run.quality,
+                run.reliability,
+                run.proposal,
+                run.submission,
             ),
             encoding="utf-8",
         )
