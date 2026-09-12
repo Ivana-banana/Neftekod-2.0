@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .. import config, constraints, features, forecast
+from .. import config, constraints, features, forecast, splits
 from .context import ScenarioContext
 from . import quality as quality_module
 from .quality import QualityAssessment
@@ -46,25 +46,86 @@ REJECTION_CODES = (
 
 @dataclass(frozen=True)
 class BlendingScenario:
-    """Модельная постановка блендинга — данных по рецептурам нет (ADR-004).
+    """Постановка блендинга: доли модельные (ADR-004), сера компонента — измеренная.
 
-    Все поля ниже являются допущениями сценария и печатаются рядом с
-    результатом. Жёсткая проверка «сумма долей = 100%» действует для них
-    наравне с реальными данными.
+    Рецептур и спецификации в пакете нет, поэтому состав и цена остаются
+    допущениями и печатаются рядом с результатом. Сера дешёвого компонента
+    берётся из реального анализа сырья гидроочистки как-of момента выдачи —
+    это первое звено цепочки, названной самими организаторами (ADR-013).
+    Жёсткая проверка «сумма долей = 100%» действует наравне с реальными данными.
     """
 
     base_component: str = "hydrotreated_diesel"
     cut_component: str = "straight_run_240_350"
-    cut_sulfur_mg_kg: float = 4000.0
+    # Сера дешёвого компонента — реальный анализ, а не придуманное число.
+    cut_sulfur_tag: str = "LIMS:Гидроочистка.1.Mass.Sulfur"
+    cut_sulfur_unit_factor: float = 10000.0  # % масс. → мг/кг
+    # Отбор сырья идёт медианно раз в 3 суток, p90 интервала — 31 сутки.
+    # Анализ старше 31 суток не используется: см. ADR-013.
+    max_cut_sulfur_age_hours: float = 31 * 24.0
     cut_relative_price: float = 0.85
-    fractions: tuple[float, ...] = (0.0, 0.01, 0.02, 0.05)
+    # Модельный текущий состав: половина доли, физически допустимой по сере
+    # при типовой (медианной по train) сере базового компонента. См. ADR-013.
+    current_cut_fraction: float = 7.4e-5
+    # Сетка кандидатов задаётся в долях физически допустимого максимума:
+    # абсолютный шаг в процентах бессмысленен, когда максимум измеряется
+    # сотыми долями процента (ADR-013).
+    candidate_fractions_of_max: tuple[float, ...] = (0.0, 0.25, 0.5, 0.75, 1.0)
 
     def mock_notice(self) -> str:
         return (
-            f"[MOCKED: блендинг модельный — рецептур и спецификации в пакете нет (ADR-004); "
-            f"сера компонента {self.cut_component} принята {self.cut_sulfur_mg_kg:g} мг/кг, "
-            f"его относительная цена {self.cut_relative_price:g} от цены товарного ДТ]"
+            f"[MOCKED: состав блендинга модельный — рецептур и спецификации в пакете нет "
+            f"(ADR-004); текущая доля {self.cut_component} принята "
+            f"{self.current_cut_fraction:.4%}, его относительная цена "
+            f"{self.cut_relative_price:g} от цены товарного ДТ. Сера этого компонента "
+            f"не выдумана: берётся из анализа {self.cut_sulfur_tag}]"
         )
+
+
+def resolve_cut_sulfur(context: ScenarioContext, blending: BlendingScenario) -> dict:
+    """Сера дешёвого компонента по реальному анализу сырья на момент выдачи.
+
+    Используется только анализ, опубликованный к моменту выдачи. Слишком
+    старый анализ не берётся: неизвестная сера компонента не считается
+    допустимой (ТЗ, §4), а состав смеси без неё не определён.
+    """
+    frame = context.long_format
+    part = frame[frame["tag"].eq(blending.cut_sulfur_tag)].copy()
+    part["value"] = pd.to_numeric(part["value"], errors="coerce")
+    part = part.dropna(subset=["value"])
+    published = splits.available_history(part, context.issue_time)
+    if published.empty:
+        return {
+            "value_mg_kg": None,
+            "refusal": {
+                "reason": f"нет опубликованного анализа {blending.cut_sulfur_tag} на момент выдачи",
+                "rule": "состав смеси без серы компонента не определён (ТЗ, §4)",
+            },
+        }
+    last = published.sort_values("timestamp").iloc[-1]
+    age_hours = (context.issue_time - pd.Timestamp(last["timestamp"])).total_seconds() / 3600.0
+    resolved = {
+        "tag": blending.cut_sulfur_tag,
+        "value_mg_kg": float(last["value"]) * blending.cut_sulfur_unit_factor,
+        "value_declared": float(last["value"]),
+        "unit_declared": str(last.get("unit_declared")),
+        "sample_time": str(pd.Timestamp(last["timestamp"])),
+        "available_at": str(pd.Timestamp(last["available_at"])),
+        "age_hours": age_hours,
+        "max_age_hours": blending.max_cut_sulfur_age_hours,
+        "evidence_type": "backtested",
+        "refusal": None,
+    }
+    if age_hours > blending.max_cut_sulfur_age_hours:
+        resolved["value_mg_kg"] = None
+        resolved["refusal"] = {
+            "reason": (
+                f"анализ сырья {blending.cut_sulfur_tag} старше "
+                f"{blending.max_cut_sulfur_age_hours / 24:g} суток (возраст {age_hours / 24:.1f} суток)"
+            ),
+            "rule": "состав смеси на устаревшем анализе компонента не определён",
+        }
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -148,6 +209,7 @@ class OptimizationProposal:
     recommended_id: str | None
     decision_rules: list
     mock_notices: list
+    blending_inputs: dict | None = None
     refusal: dict | None = None
     agent: str = field(default="optimization", init=False)
 
@@ -159,6 +221,7 @@ class OptimizationProposal:
             "recommended_id": self.recommended_id,
             "decision_rules": self.decision_rules,
             "mock_notices": self.mock_notices,
+            "blending_inputs": self.blending_inputs,
             "candidates": self.candidates,
         }
 
@@ -225,14 +288,19 @@ def propose(
         "Кандидат, эффект которого предсказан моделью, не выигравшей у "
         "выбранного baseline прогноза на отложенной истории, отклоняется: его "
         "прогноз серы не является основанием для действия.",
+        "Доли дешёвого компонента перебираются в долях физически допустимого "
+        "по сере максимума w_max = (S_предел − S_база) / (S_компонент − S_база); "
+        "сера компонента берётся из реального анализа сырья (ADR-013).",
         "Среди допустимых выбирается минимальный стоимостный прокси; при "
-        "равенстве остаётся сохранение текущего режима.",
+        "равенстве остаётся сохранение текущего режима. Экономика решает только "
+        "между уже допустимыми вариантами и никогда не делает вариант допустимым.",
     ]
 
-    if quality.refusal is not None or reliability.refusal is not None:
+    cut = resolve_cut_sulfur(context, blending)
+    if quality.refusal is not None or reliability.refusal is not None or cut["refusal"] is not None:
         reasons = [
             item["reason"]
-            for item in (quality.refusal, reliability.refusal)
+            for item in (quality.refusal, reliability.refusal, cut["refusal"])
             if item is not None
         ]
         return OptimizationProposal(
@@ -241,9 +309,13 @@ def propose(
             recommended_id=None,
             decision_rules=decision_rules,
             mock_notices=mock_notices,
+            blending_inputs=cut,
             refusal={
                 "reason": "; ".join(reasons),
-                "rule": "без прогноза качества или без границ режима кандидаты не строятся",
+                "rule": (
+                    "без прогноза качества, без границ режима или без серы компонента "
+                    "смеси кандидаты не строятся"
+                ),
             },
         )
 
@@ -262,65 +334,101 @@ def propose(
     }
     allowed_ranges = reliability.allowed_ranges
 
+    cut_sulfur = cut["value_mg_kg"]
+    current_fraction = blending.current_cut_fraction
+
+    # Массовый баланс серы: S = Σ wᵢSᵢ (ADR-004, внешний ориентир) — заявленная
+    # модель смешения, а не подогнанная под историю регрессия.
+    def blend_sulfur(fraction: float) -> float:
+        return (1.0 - fraction) * baseline_sulfur + fraction * cut_sulfur
+
+    def cost_proxy(fraction: float) -> float:
+        return (1.0 - fraction) + fraction * blending.cut_relative_price
+
+    def fractions_of(fraction: float) -> dict:
+        return {blending.base_component: 1.0 - fraction, blending.cut_component: fraction}
+
+    # Физический максимум доли дешёвого компонента по сере:
+    # w_max = (S_предел − S_база) / (S_компонент − S_база). Сетка кандидатов
+    # задаётся в долях этого максимума: абсолютный шаг в процентах бессмыслен,
+    # когда максимум измеряется сотыми долями процента (ADR-013).
+    max_fraction = (
+        min(1.0, max(0.0, (config.SULFUR_LIMIT_MG_KG - baseline_sulfur) / (cut_sulfur - baseline_sulfur)))
+        if cut_sulfur > baseline_sulfur
+        else 0.0
+    )
+
     candidates = [
         _candidate(
             identifier="hold",
             kind="no_action",
-            description="Сохранить текущий режим и текущий состав блендинга",
+            description=(
+                f"Сохранить текущий режим и текущий состав блендинга "
+                f"(доля {blending.cut_component} {current_fraction:.4%})"
+            ),
             recommendation={
                 "action": "hold",
-                "predicted_sulfur_mg_kg": baseline_sulfur,
-                "evidence_type": "backtested",
-                "blend_fractions": {blending.base_component: 1.0, blending.cut_component: 0.0},
+                "predicted_sulfur_mg_kg": blend_sulfur(current_fraction),
+                # Даже «ничего не менять» здесь — не чисто измеренное число:
+                # прогноз базового компонента backtested, но текущая доля
+                # дешёвого компонента модельная (ADR-004), поэтому сера смеси
+                # получена моделью смешения. См. ADR-013.
+                "evidence_type": (
+                    "backtested" if current_fraction == 0.0 else "simulated_unvalidated"
+                ),
+                "blend_fractions": fractions_of(current_fraction),
                 "setpoints": dict(current_setpoints),
                 "allowed_ranges": allowed_ranges,
             },
             objective={
-                "cut_component_share": 0.0,
-                "cost_proxy_rel": 1.0,
+                "cut_component_share": current_fraction,
+                "cost_proxy_rel": cost_proxy(current_fraction),
                 "severity_index": reliability.severity_index,
-                "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - baseline_sulfur,
+                "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - blend_sulfur(current_fraction),
             },
             effect_model=None,
         )
     ]
 
-    for fraction in blending.fractions:
-        if fraction <= 0:
-            continue
-        # Массовый баланс серы: S = Σ wᵢSᵢ (ADR-004, внешний ориентир).
-        # Это заявленная модель смешения, а не подогнанная под историю регрессия.
-        blended = (1.0 - fraction) * baseline_sulfur + fraction * blending.cut_sulfur_mg_kg
+    for share in blending.candidate_fractions_of_max:
+        fraction = share * max_fraction
+        if abs(fraction - current_fraction) <= 1e-12:
+            continue  # это статус-кво: он уже представлен кандидатом hold
         candidates.append(
             _candidate(
-                identifier=f"blend_{blending.cut_component}_{fraction:g}",
+                identifier=f"blend_{blending.cut_component}_f{share:g}",
                 kind="blend",
                 description=(
-                    f"Вовлечь {fraction:.0%} компонента {blending.cut_component} "
-                    "в товарный ДТ (модельный блендинг)"
+                    f"{'Повысить' if fraction > current_fraction else 'Снизить'} долю "
+                    f"{blending.cut_component} с {current_fraction:.4%} до {fraction:.4%} "
+                    f"({share:.0%} физически допустимого по сере максимума {max_fraction:.4%})"
                 ),
                 recommendation={
                     "action": "adjust_blend",
-                    "predicted_sulfur_mg_kg": blended,
+                    "predicted_sulfur_mg_kg": blend_sulfur(fraction),
                     "evidence_type": "simulated_unvalidated",
-                    "blend_fractions": {
-                        blending.base_component: 1.0 - fraction,
-                        blending.cut_component: fraction,
-                    },
+                    "blend_fractions": fractions_of(fraction),
                     "setpoints": dict(current_setpoints),
                     "allowed_ranges": allowed_ranges,
                 },
                 objective={
                     "cut_component_share": fraction,
-                    "cost_proxy_rel": (1.0 - fraction) + fraction * blending.cut_relative_price,
+                    "cost_proxy_rel": cost_proxy(fraction),
                     "severity_index": reliability.severity_index,
-                    "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - blended,
+                    "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - blend_sulfur(fraction),
                 },
                 effect_model={
                     "name": "sulfur_mass_balance",
                     "formula": "S_blend = (1-w)·S_base + w·S_cut",
+                    "cut_sulfur_mg_kg": cut_sulfur,
+                    "cut_sulfur_source": cut["tag"],
+                    "cut_sulfur_age_hours": cut["age_hours"],
+                    "max_fraction_by_sulfur": max_fraction,
                     "evidence_type": "simulated_unvalidated",
-                    "note": "балансная модель смешения; исторически не проверялась",
+                    "note": (
+                        "балансная модель смешения на измеренной сере компонента; "
+                        "сама доля исторически не проверялась"
+                    ),
                 },
             )
         )
@@ -333,7 +441,13 @@ def propose(
                 delta = direction * step
                 setpoints = dict(current_setpoints)
                 setpoints[tag] = current_setpoints[tag] + delta
-                predicted = baseline_sulfur + effect_model.sensitivity[tag] * delta
+                # Изменение уставки двигает серу базового компонента; состав
+                # смеси при этом остаётся текущим, поэтому сера товарного ДТ
+                # считается тем же массовым балансом.
+                shifted_base = baseline_sulfur + effect_model.sensitivity[tag] * delta
+                predicted = (
+                    (1.0 - current_fraction) * shifted_base + current_fraction * cut_sulfur
+                )
                 candidates.append(
                     _candidate(
                         identifier=f"setpoint_{tag}_{'plus' if direction > 0 else 'minus'}",
@@ -346,16 +460,13 @@ def propose(
                             "action": "adjust_setpoint",
                             "predicted_sulfur_mg_kg": predicted,
                             "evidence_type": "simulated_unvalidated",
-                            "blend_fractions": {
-                                blending.base_component: 1.0,
-                                blending.cut_component: 0.0,
-                            },
+                            "blend_fractions": fractions_of(current_fraction),
                             "setpoints": setpoints,
                             "allowed_ranges": allowed_ranges,
                         },
                         objective={
-                            "cut_component_share": 0.0,
-                            "cost_proxy_rel": 1.0,
+                            "cut_component_share": current_fraction,
+                            "cost_proxy_rel": cost_proxy(current_fraction),
                             "severity_index": reliability.severity_index,
                             "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - predicted,
                         },
@@ -402,6 +513,7 @@ def propose(
             recommended_id=None,
             decision_rules=decision_rules,
             mock_notices=mock_notices,
+            blending_inputs=cut,
             refusal={
                 "reason": "ни один кандидат не прошёл проверки",
                 "rule": "при отсутствии допустимого варианта рекомендация не выдаётся (ТЗ, §4)",
@@ -417,6 +529,7 @@ def propose(
         recommended_id=best["id"],
         decision_rules=decision_rules,
         mock_notices=mock_notices,
+        blending_inputs=cut,
     )
 
 
@@ -436,6 +549,7 @@ def build_submission(
     """
     blending = blending or BlendingScenario()
     recommended = proposal.recommended()
+    cut = proposal.blending_inputs or resolve_cut_sulfur(context, blending)
     horizon = min(context.backtest)
     baseline = (
         next((item for item in quality.forecast if item["horizon_hours"] == horizon), None)
@@ -460,9 +574,12 @@ def build_submission(
                     "evidence_type": None if baseline is None else baseline["evidence_type"],
                 },
                 blending.cut_component: {
-                    "sulfur_mg_kg": blending.cut_sulfur_mg_kg,
-                    "source": blending.mock_notice(),
-                    "evidence_type": "simulated_unvalidated",
+                    "sulfur_mg_kg": cut["value_mg_kg"],
+                    "source": (
+                        f"анализ {blending.cut_sulfur_tag}, отбор {cut.get('sample_time')}, "
+                        f"возраст {cut.get('age_hours')} ч"
+                    ),
+                    "evidence_type": "backtested",
                 },
             },
             "current_setpoints": {
@@ -471,8 +588,8 @@ def build_submission(
             # Текущий состав — модельный статус-кво (ADR-004). Оркестратор
             # определяет по нему «ничего не меняем» по числам, а не по ярлыку.
             "current_blend_fractions": {
-                blending.base_component: 1.0,
-                blending.cut_component: 0.0,
+                blending.base_component: 1.0 - blending.current_cut_fraction,
+                blending.cut_component: blending.current_cut_fraction,
             },
         },
         "recommendation": None if recommended is None else recommended["recommendation"],

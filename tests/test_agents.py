@@ -78,8 +78,13 @@ def _telemetry(values: dict | None = None) -> pd.DataFrame:
     return frame
 
 
-def _long_format(sulfur: float = 8.4, last_sample: str = "2026-02-03 10:00:00") -> pd.DataFrame:
-    """ЛИМС «Гидроочистка.2» и ПАК с корректным временем доступности."""
+def _long_format(
+    sulfur: float = 8.4,
+    last_sample: str = "2026-02-03 10:00:00",
+    feed_sulfur_percent: float | None = 0.95,
+    feed_sample: str = "2026-02-01 10:00:00",
+) -> pd.DataFrame:
+    """ЛИМС «Гидроочистка.2», ПАК и сера сырья с корректным временем доступности."""
     history = pd.date_range("2024-01-01 10:00", "2025-12-01 10:00", freq="1D")
     rows = [
         {
@@ -120,6 +125,19 @@ def _long_format(sulfur: float = 8.4, last_sample: str = "2026-02-03 10:00:00") 
             "value": 7.9,
         }
     )
+    if feed_sulfur_percent is not None:
+        # Сера сырья гидроочистки — реальный источник серы дешёвого компонента
+        # блендинга (ADR-013); отбор редкий, публикация +4 ч.
+        feed_stamp = pd.Timestamp(feed_sample)
+        rows.append(
+            {
+                "timestamp": feed_stamp,
+                "available_at": feed_stamp + pd.Timedelta(hours=config.LIMS_PUBLICATION_DELAY_HOURS),
+                "source": "lims",
+                "tag": optimization.BlendingScenario().cut_sulfur_tag,
+                "value": feed_sulfur_percent,
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -306,11 +324,29 @@ class TestOptimization:
             evidence = candidate["recommendation"].get("evidence_type")
             assert constraints.check_evidence_type(evidence) == [], candidate["id"]
 
-    def test_only_no_action_may_claim_backtested(self, scenario_context):
+    def test_actions_are_never_backtested(self, scenario_context):
         proposal = self._proposal(scenario_context)
         for candidate in proposal.candidates:
-            expected = "backtested" if candidate["kind"] == "no_action" else "simulated_unvalidated"
-            assert candidate["recommendation"]["evidence_type"] == expected, candidate["id"]
+            if candidate["kind"] != "no_action":
+                assert candidate["recommendation"]["evidence_type"] == "simulated_unvalidated", (
+                    candidate["id"]
+                )
+
+    def test_hold_claims_backtested_only_with_a_measured_composition(self, scenario_context):
+        """Модельная доля в текущем составе делает и «ничего не менять» моделью.
+
+        Сера смеси при ненулевой модельной доле считается балансом, а не
+        измеряется, поэтому подпись backtested ей не принадлежит (ADR-013).
+        """
+        modelled = self._proposal(scenario_context).recommended()
+        assert modelled["recommendation"]["evidence_type"] == "simulated_unvalidated"
+        pure = optimization.propose(
+            scenario_context,
+            quality.assess(scenario_context),
+            reliability.assess(scenario_context),
+            blending=optimization.BlendingScenario(current_cut_fraction=0.0),
+        ).recommended()
+        assert pure["recommendation"]["evidence_type"] == "backtested"
 
     def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
         """Порог действия берётся по худшему горизонту, на который оно влияет."""
@@ -338,7 +374,7 @@ class TestOptimization:
             assert set(candidate["rejection_codes"]) <= set(optimization.REJECTION_CODES)
             assert len(candidate["rejection_codes"]) == len(candidate["rejection_reasons"])
         blend = next(item for item in rejected if item["kind"] == "blend")
-        assert "hard_constraint" in blend["rejection_codes"]
+        assert set(blend["rejection_codes"]) <= set(optimization.REJECTION_CODES)
 
     def test_setpoint_rejected_when_effect_model_loses_to_baseline(self, scenario_context):
         """Модель эффекта, проигравшая backtest, не даёт права на действие."""
@@ -369,18 +405,65 @@ class TestOptimization:
         proposal = self._proposal(scenario_context)
         assert any("[MOCKED:" in notice for notice in proposal.mock_notices)
 
-    def test_high_sulfur_component_is_rejected_by_hard_constraint(self, scenario_context):
+    def test_blend_candidates_stay_inside_the_physical_sulfur_maximum(self, scenario_context):
+        """Сетка кандидатов строится от массового баланса, а не от круглых процентов."""
         proposal = self._proposal(scenario_context)
         blends = [item for item in proposal.candidates if item["kind"] == "blend"]
         assert blends
         for candidate in blends:
-            assert candidate["admissible"] is False
-            assert any("sulfur" in reason for reason in candidate["rejection_reasons"])
+            predicted = candidate["recommendation"]["predicted_sulfur_mg_kg"]
+            assert predicted <= config.SULFUR_LIMIT_MG_KG + 1e-9, candidate["id"]
+            assert "hard_constraint" not in candidate["rejection_codes"], candidate["id"]
+
+    def test_base_component_above_the_limit_cannot_be_fixed_by_blending(self):
+        """Сера базового компонента выше предела — отказ, а не «подберём долю»."""
+        context = _context(long_format=_long_format(sulfur=20.0))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.recommended_id is None
+        assert proposal.refusal is not None
+        for candidate in proposal.candidates:
+            assert "hard_constraint" in candidate["rejection_codes"], candidate["id"]
+
+    def test_cheaper_blend_is_recommended_when_the_margin_covers_the_forecast_error(self):
+        """Экономика решает только между допустимыми вариантами, но решает.
+
+        Запас должен покрывать ошибку прогноза, поэтому вход здесь заведомо
+        чистый. На реальном test-периоде такого запаса внутри полосы p05–p95
+        не встречается ни разу — см. ADR-013.
+        """
+        context = _context(long_format=_long_format(sulfur=0.5))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        recommended = proposal.recommended()
+        assert recommended["kind"] == "blend"
+        assert recommended["objective"]["cut_component_share"] > (
+            optimization.BlendingScenario().current_cut_fraction
+        )
+        assert recommended["objective"]["sulfur_margin_mg_kg"] >= 2.6  # backtest-RMSE фикстуры
+
+    def test_missing_feed_analysis_stops_blending(self):
+        """Без анализа серы компонента состав смеси не определён — отказ."""
+        context = _context(long_format=_long_format(feed_sulfur_percent=None))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.candidates == []
+        assert "нет опубликованного анализа" in proposal.refusal["reason"]
+
+    def test_stale_feed_analysis_stops_blending(self):
+        context = _context(long_format=_long_format(feed_sample="2025-11-01 10:00:00"))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.candidates == []
+        assert "старше" in proposal.refusal["reason"]
 
     def test_stable_period_recommends_holding(self, scenario_context):
         proposal = self._proposal(scenario_context)
         assert proposal.recommended_id == "hold"
-        assert proposal.recommended()["recommendation"]["evidence_type"] == "backtested"
 
     def test_refuses_when_quality_refused(self):
         context = _context(long_format=_long_format(last_sample="2026-01-30 10:00:00"))
