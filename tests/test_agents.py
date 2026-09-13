@@ -13,7 +13,7 @@ import dataclasses
 import pandas as pd
 import pytest
 
-from neftekod import config, constraints, features
+from neftekod import config, constraints, features, spec
 from neftekod.agents import context as context_module
 from neftekod.agents import optimization, orchestrator, quality, reliability, report
 
@@ -87,8 +87,18 @@ def _long_format(
     feed_sulfur_percent: float | None = 0.95,
     feed_sample: str = "2026-02-01 10:00:00",
     history_values: tuple[float, ...] = (8.0, 8.2, 8.4, 8.6, 8.8),
+    product_t95: float | None = 352.0,
+    cut_t95: float | None = 356.0,
+    product_cetane: float | None = 53.0,
+    cetane_sample: str = "2026-01-20 10:00:00",
 ) -> pd.DataFrame:
-    """ЛИМС «Гидроочистка.2», ПАК и сера сырья с корректным временем доступности."""
+    """ЛИМС «Гидроочистка.2», ПАК, сера сырья и показатели спецификации.
+
+    T95 и цетановое число добавлены с разной частотой отбора не для красоты:
+    именно разные пороги устаревания у этих показателей отличают их от серы
+    (ADR-015). `None` означает «анализа нет вовсе» — тогда рекомендация
+    обязана не выдаваться.
+    """
     history = pd.date_range("2024-01-01 10:00", "2025-12-01 10:00", freq="1D")
     rows = [
         {
@@ -140,6 +150,26 @@ def _long_format(
                 "source": "lims",
                 "tag": optimization.BlendingScenario().cut_sulfur_tag,
                 "value": feed_sulfur_percent,
+            }
+        )
+    # Показатели спецификации: T95 отбирается той же суточной пробой, что и
+    # сера, цетановое число — примерно раз в месяц (ADR-015).
+    for tag, value, stamp in (
+        (spec.BASE_T95_TAG, product_t95, last_sample),
+        (spec.CUT_T95_TAG, cut_t95, last_sample),
+        (spec.BASE_CETANE_TAG, product_cetane, cetane_sample),
+    ):
+        if value is None:
+            continue
+        moment = pd.Timestamp(stamp)
+        rows.append(
+            {
+                "timestamp": moment,
+                "available_at": moment
+                + pd.Timedelta(hours=config.LIMS_PUBLICATION_DELAY_HOURS),
+                "source": "lims",
+                "tag": tag,
+                "value": value,
             }
         )
     return pd.DataFrame(rows)
@@ -352,6 +382,75 @@ class TestOptimization:
         ).recommended()
         assert pure["recommendation"]["evidence_type"] == "backtested"
 
+    def test_every_candidate_carries_all_three_mandatory_indicators(self, scenario_context):
+        """Организаторы назвали обязательными три показателя, не один (ADR-004)."""
+        proposal = self._proposal(scenario_context)
+        assert proposal.candidates
+        for candidate in proposal.candidates:
+            recommendation = candidate["recommendation"]
+            assert constraints.check_sulfur(recommendation["predicted_sulfur_mg_kg"]) == []
+            assert isinstance(recommendation["predicted_t95_c"], float), candidate["id"]
+            assert isinstance(recommendation["predicted_cetane_number"], float), candidate["id"]
+
+    def test_unverified_cetane_blocks_every_candidate(self):
+        """Просроченный обязательный показатель — отказ, а не оговорка.
+
+        Цетановое число отбирается примерно раз в месяц; анализ старше порога
+        не подставляется как будто он свежий, поэтому сертифицировать нечего.
+        """
+        stale = str(ISSUE_TIME - pd.Timedelta(hours=config.CETANE_MAX_AGE_HOURS + 24))
+        context = _context(long_format=_long_format(cetane_sample=stale))
+        assessment = quality.assess(context)
+        # Агент качества при этом не отказывается от прогноза серы: оператор
+        # обязан увидеть риск по сере, даже когда ЦЧ не подтверждено.
+        assert assessment.refusal is None
+        assert assessment.spec_indicators["cetane_number"]["verified"] is False
+        proposal = optimization.propose(context, assessment, reliability.assess(context))
+        assert proposal.recommended_id is None
+        assert proposal.refusal is not None
+        for candidate in proposal.candidates:
+            assert "cetane_number" in " ".join(candidate["rejection_reasons"]), candidate["id"]
+            assert "hard_constraint" in candidate["rejection_codes"], candidate["id"]
+
+    def test_absent_t95_blocks_every_candidate(self):
+        context = _context(long_format=_long_format(product_t95=None))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.recommended_id is None
+        assert all(
+            "t95" in " ".join(candidate["rejection_reasons"]) for candidate in proposal.candidates
+        )
+
+    def test_t95_above_limit_rejects_the_blend_even_with_sulfur_headroom(self):
+        """Запас по сере не покупает нарушение по T95 (ТЗ, §4)."""
+        context = _context(long_format=_long_format(sulfur=3.0, product_t95=366.0))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.recommended_id is None
+        reasons = " ".join(
+            reason for candidate in proposal.candidates for reason in candidate["rejection_reasons"]
+        )
+        assert "T95" in reasons
+
+    def test_setpoint_candidates_admit_the_spec_effect_is_unmodelled(self, scenario_context):
+        """Система не делает вид, что знает T95 после изменения уставки."""
+        model = optimization.fit_effect_model(scenario_context)
+        proposal = optimization.propose(
+            scenario_context,
+            quality.assess(scenario_context),
+            reliability.assess(scenario_context),
+            effect_model=model,
+        )
+        setpoint_candidates = [
+            item for item in proposal.candidates if item["kind"] == "setpoint"
+        ]
+        assert setpoint_candidates
+        for candidate in setpoint_candidates:
+            assert "unmodelled_spec_effect" in candidate["rejection_codes"], candidate["id"]
+            assert not candidate["admissible"]
+
     def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
         """Порог действия берётся по худшему горизонту, на который оно влияет."""
         backtest = {
@@ -554,6 +653,52 @@ class TestOrchestrator:
         assert any("не совпадает с пересчитанной" in reason for reason in decision.rejection_reasons)
         check = next(item for item in decision.checks if item["check"] == "blend_sulfur_recomputed")
         assert check["passed"] is False
+
+    def test_claimed_t95_must_survive_independent_recomputation(self, scenario_context):
+        """Заниженный T95 в пакете не проходит: оркестратор считает смесь сам."""
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"] = submission["recommendation"] | {"predicted_t95_c": 340.0}
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(item for item in decision.checks if item["check"] == "blend_t95_recomputed")
+        assert check["passed"] is False
+
+    def test_claimed_cetane_must_survive_independent_recomputation(self, scenario_context):
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"] = submission["recommendation"] | {
+            "predicted_cetane_number": 58.0
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(item for item in decision.checks if item["check"] == "blend_cetane_recomputed")
+        assert check["passed"] is False
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [("t95_limit_c", 380.0), ("cetane_number_min", 45.0)],
+    )
+    def test_spec_limits_cannot_be_relaxed_in_the_package(self, scenario_context, key, value):
+        """Смягчить предел подменой поля в пакете нельзя — как и предел серы."""
+        submission, sources = _submission(scenario_context)
+        submission["applied_constraints"] = submission["applied_constraints"] | {key: value}
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(item for item in decision.checks if item["check"] == f"{key}_unchanged")
+        assert check["passed"] is False
+
+    def test_component_indicator_removed_from_input_is_not_silently_skipped(
+        self, scenario_context
+    ):
+        """Пропавший показатель компонента — причина отклонения, а не пропуск проверки."""
+        submission, sources = _submission(scenario_context)
+        components = {
+            name: {key: item for key, item in value.items() if key != "t95_c"}
+            for name, value in submission["input"]["components"].items()
+        }
+        submission["input"] = submission["input"] | {"components": components}
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("не воспроизводится" in reason for reason in decision.rejection_reasons)
 
     def test_agent_cannot_widen_its_own_ranges(self, scenario_context):
         submission, sources = _submission(scenario_context)

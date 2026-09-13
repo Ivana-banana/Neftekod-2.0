@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .. import config, constraints
+from .. import config, constraints, spec
 
 SUBMISSION_KEYS = frozenset({"input", "recommendation", "applied_constraints", "refusals"})
 # Вложенные allowlist: плоской проверки верхнего уровня мало — обоснование
@@ -35,6 +35,8 @@ RECOMMENDATION_KEYS = frozenset(
     {
         "action",
         "predicted_sulfur_mg_kg",
+        "predicted_t95_c",
+        "predicted_cetane_number",
         "evidence_type",
         "blend_fractions",
         "setpoints",
@@ -44,6 +46,8 @@ RECOMMENDATION_KEYS = frozenset(
 APPLIED_CONSTRAINT_KEYS = frozenset(
     {
         "sulfur_limit_mg_kg",
+        "t95_limit_c",
+        "cetane_number_min",
         "blend_fraction_sum",
         "allowed_ranges",
         "allowed_ranges_basis",
@@ -67,6 +71,10 @@ REVIEW_LIMITS = (
     "данными, потому что данных по рецептурам в пакете нет.",
     "Проверка подтверждает допустимость режима по заявленным ограничениям, "
     "а не безопасность режима в цехе.",
+    "T95 и цетановое число смеси пересчитываются по моделям смешения "
+    "(массовый баланс и blend index, ADR-015), а сами модели историей не "
+    "проверялись: воспроизводимо — арифметика, а не физика смешения. "
+    "Цетановое число дешёвого компонента вообще не измеряется (допущение).",
 )
 
 
@@ -140,6 +148,60 @@ def _recompute_blend_sulfur(components: dict, fractions: dict) -> tuple[float | 
             return None, f"у компонента {name} нет числовой серы: {sulfur!r}"
         total += float(weight) * float(sulfur)
     return total, "S = Σ wᵢ·Sᵢ, пересчитано оркестратором по входу"
+
+
+def _component_values(components: dict, fractions: dict, key: str) -> tuple[dict | None, str]:
+    """Значения показателя по компонентам входа; None, если хоть одно неизвестно."""
+    values = {}
+    for name in fractions or {}:
+        item = components.get(name) or {}
+        value = item.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or math.isnan(value):
+            return None, f"у компонента {name} нет числового значения {key}: {value!r}"
+        values[name] = float(value)
+    return values, f"значения {key} взяты из компонентов входа"
+
+
+def _verify_blended(
+    name: str,
+    claimed,
+    components: dict,
+    fractions: dict,
+    key: str,
+    model,
+    checks: list,
+    reasons: list,
+    unit: str,
+) -> None:
+    """Пересчитать показатель смеси своей копией модели и сверить с заявленным.
+
+    Оркестратор не берёт число у агента оптимизации на слово: модель смешения
+    вызывается здесь заново на компонентах входа. Неизвестный компонент — не
+    «пропустим проверку», а причина отклонения (ADR-015).
+    """
+    values, detail = _component_values(components, fractions, key)
+    if values is None:
+        checks.append(_check(name, False, detail))
+        reasons.append(f"показатель смеси не воспроизводится: {detail}")
+        return
+    recomputed = model(fractions, values)
+    if recomputed is None:
+        checks.append(_check(name, False, f"модель смешения не дала значения: {detail}"))
+        reasons.append(f"показатель смеси не воспроизводится по модели: {detail}")
+        return
+    matches = (
+        isinstance(claimed, (int, float))
+        and not isinstance(claimed, bool)
+        and math.isclose(recomputed, float(claimed), rel_tol=1e-9, abs_tol=1e-6)
+    )
+    checks.append(
+        _check(name, matches, f"{detail}: получено {recomputed:.8g} {unit}, заявлено {claimed!r}")
+    )
+    if not matches:
+        reasons.append(
+            f"заявленное значение {claimed!r} {unit} не совпадает с пересчитанным "
+            f"{recomputed:.8g} {unit}"
+        )
 
 
 def _close(left, right, tolerance: float = SETPOINT_TOLERANCE) -> bool:
@@ -341,6 +403,20 @@ def review(submission: dict, *, sources: dict) -> Decision:
             _check("sulfur_limit_unchanged", True, f"{config.SULFUR_LIMIT_MG_KG} мг/кг")
         )
 
+    for key, project_value, title in (
+        ("t95_limit_c", config.T95_LIMIT_C, "предел T95"),
+        ("cetane_number_min", config.CETANE_NUMBER_MIN, "минимум цетанового числа"),
+    ):
+        applied_value = applied.get(key, project_value)
+        if applied_value != project_value:
+            reasons.append(
+                f"применённый {title} {applied_value} не совпадает со значением проекта "
+                f"{project_value}"
+            )
+            checks.append(_check(f"{key}_unchanged", False, f"получено {applied_value}"))
+        else:
+            checks.append(_check(f"{key}_unchanged", True, str(project_value)))
+
     _cross_check_with_roles(submission, sources, checks, reasons)
 
     claimed = recommendation.get("predicted_sulfur_mg_kg")
@@ -366,6 +442,29 @@ def review(submission: dict, *, sources: dict) -> Decision:
                     f"заявленная сера {claimed!r} мг/кг не совпадает с пересчитанной "
                     f"{recomputed:.6g} мг/кг"
                 )
+        components = submission["input"].get("components") or {}
+        _verify_blended(
+            "blend_t95_recomputed",
+            recommendation.get("predicted_t95_c"),
+            components,
+            fractions,
+            "t95_c",
+            spec.blend_t95,
+            checks,
+            reasons,
+            "°C",
+        )
+        _verify_blended(
+            "blend_cetane_recomputed",
+            recommendation.get("predicted_cetane_number"),
+            components,
+            fractions,
+            "cetane_number",
+            spec.blend_cetane_number,
+            checks,
+            reasons,
+            "ед. ЦЧ",
+        )
 
     allowed = applied.get("allowed_ranges") or {}
     declared = recommendation.get("allowed_ranges") or {}
@@ -484,8 +583,9 @@ def review(submission: dict, *, sources: dict) -> Decision:
         explanation=(
             f"Рекомендация «{action}» утверждена: жёсткие проверки выполнены оркестратором "
             "заново на числах рекомендации, ограничения сверены с независимыми выводами "
-            "агентов качества и надёжности, сера смеси пересчитана по входу, статус-кво "
-            "определён по фактическим уставкам, а не по ярлыку. "
+            "агентов качества и надёжности, все три обязательных показателя смеси — сера, "
+            "T95 и цетановое число — пересчитаны по входу своими моделями смешения, "
+            "статус-кво определён по фактическим уставкам, а не по ярлыку. "
             f"Тип обоснования: {recommendation.get('evidence_type')}."
         ),
         received_keys=sorted(submission),

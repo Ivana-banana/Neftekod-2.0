@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .. import config, constraints, features, forecast, splits
+from .. import config, constraints, features, forecast, spec, splits
 from .context import ScenarioContext
 from . import quality as quality_module
 from .quality import QualityAssessment
@@ -42,6 +42,7 @@ REJECTION_CODES = (
     "unvalidated_effect_model",
     "regime_inadmissible",
     "anomalous_input",
+    "unmodelled_spec_effect",
 )
 
 
@@ -65,6 +66,10 @@ class BlendingScenario:
     # Анализ старше 31 суток не используется: см. ADR-013.
     max_cut_sulfur_age_hours: float = 31 * 24.0
     cut_relative_price: float = 0.85
+    # Цетановое число дешёвого компонента не измеряется нигде в пакете —
+    # единственный показатель спецификации, целиком взятый из допущения
+    # (spec.CUT_CETANE_NUMBER, ADR-015).
+    cut_cetane_number: float = spec.CUT_CETANE_NUMBER
     # Модельный текущий состав: половина доли, физически допустимой по сере
     # при типовой (медианной по train) сере базового компонента. См. ADR-013.
     current_cut_fraction: float = 7.4e-5
@@ -79,7 +84,9 @@ class BlendingScenario:
             f"(ADR-004); текущая доля {self.cut_component} принята "
             f"{self.current_cut_fraction:.4%}, его относительная цена "
             f"{self.cut_relative_price:g} от цены товарного ДТ. Сера этого компонента "
-            f"не выдумана: берётся из анализа {self.cut_sulfur_tag}]"
+            f"не выдумана: берётся из анализа {self.cut_sulfur_tag}, T95 — из "
+            f"{spec.CUT_T95_TAG}. Цетановое число этого компонента в пакете не "
+            f"измеряется и принято {self.cut_cetane_number:g} — допущение]"
         )
 
 
@@ -211,6 +218,7 @@ class OptimizationProposal:
     decision_rules: list
     mock_notices: list
     blending_inputs: dict | None = None
+    spec_inputs: dict | None = None
     refusal: dict | None = None
     agent: str = field(default="optimization", init=False)
 
@@ -223,6 +231,7 @@ class OptimizationProposal:
             "decision_rules": self.decision_rules,
             "mock_notices": self.mock_notices,
             "blending_inputs": self.blending_inputs,
+            "spec_inputs": self.spec_inputs,
             "candidates": self.candidates,
         }
 
@@ -295,12 +304,23 @@ def propose(
         "Доли дешёвого компонента перебираются в долях физически допустимого "
         "по сере максимума w_max = (S_предел − S_база) / (S_компонент − S_база); "
         "сера компонента берётся из реального анализа сырья (ADR-013).",
+        "Обязательных показателей товарного ДТ три, а не один (ADR-004): сера "
+        f"≤ {config.SULFUR_LIMIT_MG_KG:g} мг/кг, T95 ≤ {config.T95_LIMIT_C:g} °C и "
+        f"цетановое число ≥ {config.CETANE_NUMBER_MIN:g}. Показатель, не "
+        "подтверждённый свежим анализом, не считается выполненным: кандидат "
+        "отклоняется жёстким ограничением, а не проходит с оговоркой (ADR-015).",
+        "Влияние изменения уставок P8/T11/F19 на T95 и цетановое число не "
+        "моделируется: модели нет, а подставлять текущее измерение как прогноз "
+        "после действия нельзя. Поэтому кандидат, меняющий уставки, отклоняется "
+        "кодом unmodelled_spec_effect независимо от результата по сере (ADR-015).",
         "Среди допустимых выбирается минимальный стоимостный прокси; при "
         "равенстве остаётся сохранение текущего режима. Экономика решает только "
         "между уже допустимыми вариантами и никогда не делает вариант допустимым.",
     ]
 
     cut = resolve_cut_sulfur(context, blending)
+    # T95 дешёвого компонента — тоже измерение, а не допущение (ADR-015).
+    cut_t95 = spec.resolve_cut_t95(context.long_format, context.issue_time)
     if quality.refusal is not None or reliability.refusal is not None or cut["refusal"] is not None:
         reasons = [
             item["reason"]
@@ -314,6 +334,7 @@ def propose(
             decision_rules=decision_rules,
             mock_notices=mock_notices,
             blending_inputs=cut,
+            spec_inputs={"cut_t95": cut_t95.to_dict()},
             refusal={
                 "reason": "; ".join(reasons),
                 "rule": (
@@ -340,11 +361,44 @@ def propose(
 
     cut_sulfur = cut["value_mg_kg"]
     current_fraction = blending.current_cut_fraction
+    # Измеренные показатели продукта приходят от агента качества, а не
+    # добываются здесь заново: оркестратор сверяет пакет именно с его выводом
+    # (ADR-010, §6а). Неподтверждённый показатель приходит со value = None.
+    product_indicators = quality.spec_indicators or {}
 
     # Массовый баланс серы: S = Σ wᵢSᵢ (ADR-004, внешний ориентир) — заявленная
     # модель смешения, а не подогнанная под историю регрессия.
     def blend_sulfur(fraction: float) -> float:
         return (1.0 - fraction) * baseline_sulfur + fraction * cut_sulfur
+
+    # Показатели спецификации смешиваются по своим моделям (ADR-015):
+    # T95 — массовым балансом, цетановое число — нелинейным blend index.
+    # Значение компонента, не подтверждённое анализом, равно None, и тогда
+    # показатель смеси тоже None — жёсткая проверка отклонит такого кандидата.
+    component_t95 = {
+        blending.base_component: (product_indicators.get("t95") or {}).get("value"),
+        blending.cut_component: cut_t95.value,
+    }
+    component_cetane = {
+        blending.base_component: (product_indicators.get("cetane_number") or {}).get("value"),
+        blending.cut_component: blending.cut_cetane_number,
+    }
+
+    def blend_t95(fraction: float):
+        return spec.blend_t95(fractions_of(fraction), component_t95)
+
+    def blend_cetane(fraction: float):
+        return spec.blend_cetane_number(fractions_of(fraction), component_cetane)
+
+    def spec_margins(fraction: float) -> dict:
+        t95 = blend_t95(fraction)
+        cetane = blend_cetane(fraction)
+        return {
+            "t95_c": t95,
+            "t95_margin_c": None if t95 is None else config.T95_LIMIT_C - t95,
+            "cetane_number": cetane,
+            "cetane_margin": None if cetane is None else cetane - config.CETANE_NUMBER_MIN,
+        }
 
     def cost_proxy(fraction: float) -> float:
         return (1.0 - fraction) + fraction * blending.cut_relative_price
@@ -373,6 +427,8 @@ def propose(
             recommendation={
                 "action": "hold",
                 "predicted_sulfur_mg_kg": blend_sulfur(current_fraction),
+                "predicted_t95_c": blend_t95(current_fraction),
+                "predicted_cetane_number": blend_cetane(current_fraction),
                 # Даже «ничего не менять» здесь — не чисто измеренное число:
                 # прогноз базового компонента backtested, но текущая доля
                 # дешёвого компонента модельная (ADR-004), поэтому сера смеси
@@ -389,6 +445,7 @@ def propose(
                 "cost_proxy_rel": cost_proxy(current_fraction),
                 "severity_index": reliability.severity_index,
                 "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - blend_sulfur(current_fraction),
+                **spec_margins(current_fraction),
             },
             effect_model=None,
         )
@@ -410,6 +467,8 @@ def propose(
                 recommendation={
                     "action": "adjust_blend",
                     "predicted_sulfur_mg_kg": blend_sulfur(fraction),
+                    "predicted_t95_c": blend_t95(fraction),
+                    "predicted_cetane_number": blend_cetane(fraction),
                     "evidence_type": "simulated_unvalidated",
                     "blend_fractions": fractions_of(fraction),
                     "setpoints": dict(current_setpoints),
@@ -420,6 +479,7 @@ def propose(
                     "cost_proxy_rel": cost_proxy(fraction),
                     "severity_index": reliability.severity_index,
                     "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - blend_sulfur(fraction),
+                    **spec_margins(fraction),
                 },
                 effect_model={
                     "name": "sulfur_mass_balance",
@@ -428,6 +488,16 @@ def propose(
                     "cut_sulfur_source": cut["tag"],
                     "cut_sulfur_age_hours": cut["age_hours"],
                     "max_fraction_by_sulfur": max_fraction,
+                    "t95_model": "T95_blend = Σ wᵢ·T95ᵢ (массовый баланс, ADR-015)",
+                    "cut_t95_c": cut_t95.value,
+                    "cut_t95_source": cut_t95.tag,
+                    "cut_t95_age_hours": cut_t95.age_hours,
+                    "cetane_model": (
+                        f"CN_blend = (Σ wᵢ·CNᵢ^{spec.CETANE_BLEND_INDEX_EXPONENT:g})"
+                        f"^(1/{spec.CETANE_BLEND_INDEX_EXPONENT:g}) (blend index, ADR-004)"
+                    ),
+                    "cut_cetane_number": blending.cut_cetane_number,
+                    "cut_cetane_basis": spec.CUT_CETANE_BASIS,
                     "evidence_type": "simulated_unvalidated",
                     "note": (
                         "балансная модель смешения на измеренной сере компонента; "
@@ -463,6 +533,11 @@ def propose(
                         recommendation={
                             "action": "adjust_setpoint",
                             "predicted_sulfur_mg_kg": predicted,
+                            # Модели влияния уставок на T95 и ЦЧ нет: сюда
+                            # кладётся состояние до действия, а сам кандидат
+                            # ниже отклоняется кодом unmodelled_spec_effect.
+                            "predicted_t95_c": blend_t95(current_fraction),
+                            "predicted_cetane_number": blend_cetane(current_fraction),
                             "evidence_type": "simulated_unvalidated",
                             "blend_fractions": fractions_of(current_fraction),
                             "setpoints": setpoints,
@@ -473,6 +548,7 @@ def propose(
                             "cost_proxy_rel": cost_proxy(current_fraction),
                             "severity_index": reliability.severity_index,
                             "sulfur_margin_mg_kg": config.SULFUR_LIMIT_MG_KG - predicted,
+                            **spec_margins(current_fraction),
                         },
                         effect_model=effect_model.to_dict(),
                     )
@@ -505,6 +581,13 @@ def propose(
                     f"(severity_index {reliability.severity_index:.3g})"
                 )
                 codes.append("regime_inadmissible")
+            if candidate["recommendation"].get("action") == "adjust_setpoint":
+                reasons.append(
+                    "влияние изменения уставки на T95 и цетановое число не "
+                    "моделируется: обязательные показатели после действия "
+                    "неизвестны, поэтому действие не сертифицируется (ADR-015)"
+                )
+                codes.append("unmodelled_spec_effect")
             if (quality.input_anomaly or {}).get("anomalous"):
                 detail = "; ".join(
                     item["detail"] for item in quality.input_anomaly.get("flags", [])
@@ -526,6 +609,7 @@ def propose(
             decision_rules=decision_rules,
             mock_notices=mock_notices,
             blending_inputs=cut,
+            spec_inputs={"cut_t95": cut_t95.to_dict()},
             refusal={
                 "reason": "ни один кандидат не прошёл проверки",
                 "rule": "при отсутствии допустимого варианта рекомендация не выдаётся (ТЗ, §4)",
@@ -542,6 +626,7 @@ def propose(
         decision_rules=decision_rules,
         mock_notices=mock_notices,
         blending_inputs=cut,
+        spec_inputs={"cut_t95": cut_t95.to_dict()},
     )
 
 
@@ -562,6 +647,10 @@ def build_submission(
     blending = blending or BlendingScenario()
     recommended = proposal.recommended()
     cut = proposal.blending_inputs or resolve_cut_sulfur(context, blending)
+    cut_t95 = ((proposal.spec_inputs or {}).get("cut_t95")) or spec.resolve_cut_t95(
+        context.long_format, context.issue_time
+    ).to_dict()
+    product = quality.spec_indicators or {}
     horizon = min(context.backtest)
     baseline = (
         next((item for item in quality.forecast if item["horizon_hours"] == horizon), None)
@@ -584,6 +673,10 @@ def build_submission(
                     "sulfur_mg_kg": None if baseline is None else baseline["predicted_sulfur_mg_kg"],
                     "source": "прогноз агента качества (сдвинутый persistence по ЛИМС «Гидроочистка.2»)",
                     "evidence_type": None if baseline is None else baseline["evidence_type"],
+                    # T95 и ЦЧ базового компонента — измерения того же агента
+                    # качества; оркестратор пересчитывает по ним смесь сам.
+                    "t95_c": (product.get("t95") or {}).get("value"),
+                    "cetane_number": (product.get("cetane_number") or {}).get("value"),
                 },
                 blending.cut_component: {
                     "sulfur_mg_kg": cut["value_mg_kg"],
@@ -592,6 +685,8 @@ def build_submission(
                         f"возраст {cut.get('age_hours')} ч"
                     ),
                     "evidence_type": "backtested",
+                    "t95_c": cut_t95.get("value"),
+                    "cetane_number": blending.cut_cetane_number,
                 },
             },
             "current_setpoints": {
@@ -607,6 +702,8 @@ def build_submission(
         "recommendation": None if recommended is None else recommended["recommendation"],
         "applied_constraints": {
             "sulfur_limit_mg_kg": config.SULFUR_LIMIT_MG_KG,
+            "t95_limit_c": config.T95_LIMIT_C,
+            "cetane_number_min": config.CETANE_NUMBER_MIN,
             "blend_fraction_sum": config.BLEND_FRACTION_SUM,
             "allowed_ranges": reliability.allowed_ranges,
             "allowed_ranges_basis": reliability.allowed_ranges_basis,

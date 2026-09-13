@@ -28,6 +28,41 @@ class TestSulfur:
         assert rules(constraints.check_sulfur(value)) == {"sulfur"}
 
 
+class TestT95:
+    """T95 — обязательный показатель наравне с серой (ADR-004, ADR-015)."""
+
+    def test_limit_value_is_allowed(self):
+        assert constraints.check_t95(config.T95_LIMIT_C) == []
+
+    @pytest.mark.parametrize("value", [360.0001, 361.0, 370, 400])
+    def test_above_limit_is_violation(self, value):
+        assert rules(constraints.check_t95(value)) == {"t95"}
+
+    @pytest.mark.parametrize("value", [None, float("nan"), "350", "", True])
+    def test_missing_or_non_numeric_is_violation(self, value):
+        """«Не измерили» не означает «в пределах нормы»."""
+        assert rules(constraints.check_t95(value)) == {"t95"}
+
+
+class TestCetaneNumber:
+    """Единственное ограничение проекта снизу: чем меньше, тем хуже."""
+
+    def test_minimum_value_is_allowed(self):
+        assert constraints.check_cetane_number(config.CETANE_NUMBER_MIN) == []
+
+    @pytest.mark.parametrize("value", [50.9999, 50.0, 45, 0])
+    def test_below_minimum_is_violation(self, value):
+        assert rules(constraints.check_cetane_number(value)) == {"cetane_number"}
+
+    def test_direction_is_not_confused_with_the_others(self):
+        """Большое значение — это хорошо: перепутанное направление поймано тестом."""
+        assert constraints.check_cetane_number(58.0) == []
+
+    @pytest.mark.parametrize("value", [None, float("nan"), "52", "", True])
+    def test_missing_or_non_numeric_is_violation(self, value):
+        assert rules(constraints.check_cetane_number(value)) == {"cetane_number"}
+
+
 class TestBlendFractions:
     def test_sum_of_one_is_allowed(self):
         assert constraints.check_blend_fractions({"a": 0.6, "b": 0.4}) == []
@@ -78,6 +113,8 @@ class TestValidateRecommendation:
     def _valid(self):
         return {
             "predicted_sulfur_mg_kg": 8.2,
+            "predicted_t95_c": 352.0,
+            "predicted_cetane_number": 53.0,
             "evidence_type": "simulated_unvalidated",
             "blend_fractions": {"godt": 0.85, "fraction_240_350": 0.15},
             "setpoints": {"T5": 352.0},
@@ -96,15 +133,41 @@ class TestValidateRecommendation:
         }
         assert rules(constraints.validate_recommendation(recommendation)) == {"sulfur"}
 
+    @pytest.mark.parametrize("key", ["predicted_t95_c", "predicted_cetane_number"])
+    def test_missing_mandatory_indicator_rejects_recommendation(self, key):
+        """Три обязательных показателя проверяются безусловно, а не «если поле есть».
+
+        Иначе рекомендацию можно было бы провести, просто не положив показатель
+        в пакет — ровно то, что запрещает ответ организаторов (ADR-004).
+        """
+        recommendation = {name: value for name, value in self._valid().items() if name != key}
+        assert constraints.validate_recommendation(recommendation) != []
+
+    def test_t95_violation_is_not_excused_by_sulfur_margin(self):
+        """Запас по одному показателю не компенсирует нарушение по другому."""
+        recommendation = self._valid() | {"predicted_sulfur_mg_kg": 1.0, "predicted_t95_c": 366.0}
+        assert rules(constraints.validate_recommendation(recommendation)) == {"t95"}
+
+    def test_cetane_violation_is_not_excused_by_cheaper_blend(self):
+        recommendation = self._valid() | {
+            "predicted_cetane_number": 49.5,
+            "expected_cost_saving_pct": 15.0,
+        }
+        assert rules(constraints.validate_recommendation(recommendation)) == {"cetane_number"}
+
     def test_violations_accumulate(self):
         recommendation = {
             "predicted_sulfur_mg_kg": 11.0,
+            "predicted_t95_c": 372.0,
+            "predicted_cetane_number": 44.0,
             "blend_fractions": {"a": 0.5, "b": 0.4},
             "setpoints": {"T5": 500.0},
             "allowed_ranges": {"T5": (330.0, 370.0)},
         }
         assert rules(constraints.validate_recommendation(recommendation)) == {
             "sulfur",
+            "t95",
+            "cetane_number",
             "evidence_type",
             "blend_fractions",
             "range",

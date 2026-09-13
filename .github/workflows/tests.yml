@@ -35,7 +35,7 @@ jobs:
         # критерию «Оптимизация и безопасность» (CLAUDE.md), и в логе сборки
         # их результат должен быть виден отдельной строкой, а не внутри 180
         # остальных тестов.
-        run: pytest -q tests/test_hard_constraints.py
+        run: pytest -q tests/test_hard_constraints.py tests/test_spec.py
 
       - name: evidence_type не пропущен ни у одного вывода оптимизации
         # Требование CLAUDE.md: поле backtested / simulated_unvalidated

@@ -67,6 +67,36 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
             f"| {title} | {value} | {_age(item.get('age_hours'))} | "
             f"{'да' if item.get('units_confirmed') else 'нет — ' + UNITS_NOT_CONFIRMED} |"
         )
+    indicators = quality.spec_indicators or {}
+    if indicators:
+        lines += [
+            "",
+            "Обязательные показатели товарного ДТ (ТЗ и ответы организаторов — три, "
+            "не один):",
+            "",
+            "| Показатель | Измерено | Предел | Запас | Свежесть | Подтверждён |",
+            "|---|---|---|---|---|---|",
+        ]
+        t95 = indicators.get("t95") or {}
+        cetane = indicators.get("cetane_number") or {}
+        lines.append(
+            f"| T95, °C | {_fmt(t95.get('value'), 5)} | ≤ {config.T95_LIMIT_C:g} | "
+            f"{_fmt(t95.get('margin_c'), 3)} | {_age(t95.get('age_hours'))} | "
+            f"{'да' if t95.get('verified') else 'НЕТ — ' + str(t95.get('detail'))} |"
+        )
+        lines.append(
+            f"| Цетановое число | {_fmt(cetane.get('value'), 5)} | "
+            f"≥ {config.CETANE_NUMBER_MIN:g} | {_fmt(cetane.get('margin'), 3)} | "
+            f"{_age(cetane.get('age_hours'))} | "
+            f"{'да' if cetane.get('verified') else 'НЕТ — ' + str(cetane.get('detail'))} |"
+        )
+        lines += [
+            "",
+            f"Пределы T95 и цетанового числа — параметры сценария по ГОСТ 32511-2013 / "
+            f"ГОСТ Р 52368 для К5: организаторы назвали показатели обязательными, но "
+            f"численные пределы оставили команде (ADR-004, ADR-015). Предел серы "
+            f"{config.SULFUR_LIMIT_MG_KG:g} мг/кг задан организаторами.",
+        ]
     components = (submission.get("input") or {}).get("components") or {}
     fractions = (submission.get("input") or {}).get("current_blend_fractions") or {}
     if fractions:
@@ -95,6 +125,13 @@ def _risk_block(decision, quality, reliability, proposal) -> list[str]:
             + (f" (полоса обучения {band[0]:g}–{band[1]:g} мг/кг)" if len(band) == 2 else "")
             + ". Действия на таком измерении не рекомендуются (ADR-014)."
         )
+    for name, title in (("t95", "T95"), ("cetane_number", "цетановое число")):
+        item = (quality.spec_indicators or {}).get(name) or {}
+        if item and not item.get("verified"):
+            lines.append(
+                f"- **Обязательный показатель «{title}» не подтверждён**: {item.get('detail')}. "
+                "Изменение режима на таком входе не сертифицируется (ADR-015)."
+            )
     if quality.refusal:
         lines.append(f"- Агент качества отказался от прогноза: {quality.refusal['reason']}.")
     else:
@@ -173,6 +210,15 @@ def _effect_block(decision, proposal, submission) -> list[str]:
         f"- Прогноз серы товарного ДТ: **{recommendation['predicted_sulfur_mg_kg']:.4g} мг/кг** "
         f"при пределе {config.SULFUR_LIMIT_MG_KG:g} мг/кг "
         f"(запас {objective.get('sulfur_margin_mg_kg', float('nan')):.4g} мг/кг).",
+        f"- Прогноз T95 смеси: **{_fmt(recommendation.get('predicted_t95_c'), 5)} °C** "
+        f"при пределе {config.T95_LIMIT_C:g} °C (запас "
+        f"{_fmt(objective.get('t95_margin_c'), 3)} °C). Модель смешения — массовый "
+        "баланс, историей не проверялась (ADR-015).",
+        f"- Прогноз цетанового числа смеси: "
+        f"**{_fmt(recommendation.get('predicted_cetane_number'), 5)}** при минимуме "
+        f"{config.CETANE_NUMBER_MIN:g} (запас {_fmt(objective.get('cetane_margin'), 3)}). "
+        "Берётся худшая из двух рассматриваемых моделей смешения; цетановое число "
+        "дешёвого компонента в пакете не измеряется и принято допущением (ADR-015).",
         f"- Тип обоснования: `{recommendation['evidence_type']}`.",
     ]
     cost = objective.get("cost_proxy_rel")
@@ -263,6 +309,15 @@ def _confidence_block(quality, proposal) -> list[str]:
             f"({blending['value_declared']:g} {blending['unit_declared']}, отбор "
             f"{blending['sample_time']}, {_age(blending['age_hours'])}), а не назначена (ADR-013)."
         )
+    cut_t95 = (proposal.spec_inputs or {}).get("cut_t95") or {}
+    if cut_t95.get("value") is not None:
+        lines.append(
+            f"- T95 дешёвого компонента взят из анализа `{cut_t95['tag']}` "
+            f"({cut_t95['value']:g} °C, отбор {cut_t95['sample_time']}, "
+            f"{_age(cut_t95['age_hours'])}), а не назначен (ADR-015)."
+        )
+    elif cut_t95:
+        lines.append(f"- T95 дешёвого компонента не подтверждён: {cut_t95.get('detail')}.")
     for assumption in quality.assumptions:
         lines.append(f"- Допущение: {assumption}")
     return lines

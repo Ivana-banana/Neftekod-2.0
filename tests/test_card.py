@@ -88,3 +88,28 @@ def test_saved_scenario_cards_have_all_seven_sections(name):
     text = path.read_text(encoding="utf-8")
     for index, section in enumerate(card.SECTIONS, start=1):
         assert f"## {index}. {section}" in text, f"{name}: {section}"
+
+
+def test_all_three_mandatory_indicators_are_shown_with_freshness():
+    """Оператор видит все три обязательных показателя, а не только серу (ADR-015)."""
+    text = _card(_context())
+    assert "| T95, °C |" in text
+    assert "| Цетановое число |" in text
+    assert f"≤ {config.T95_LIMIT_C:g}" in text
+    assert f"≥ {config.CETANE_NUMBER_MIN:g}" in text
+    assert "Прогноз T95 смеси" in text
+    assert "Прогноз цетанового числа смеси" in text
+
+
+def test_spec_limits_are_labelled_as_scenario_parameters_not_as_a_norm():
+    """Предел серы задан организаторами, два других — нет; путать нельзя."""
+    text = _card(_context())
+    assert "параметры сценария по ГОСТ" in text
+    assert "численные пределы оставили команде" in text
+
+
+def test_unverified_indicator_is_named_in_the_risk_block():
+    stale = _long_format(cetane_sample="2025-11-01 10:00:00")
+    text = _card(_context(long_format=stale))
+    assert "не подтверждён" in text
+    assert "не сертифицируется" in text

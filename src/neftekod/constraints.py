@@ -53,6 +53,43 @@ def check_sulfur(value_mg_kg) -> list[Violation]:
     return []
 
 
+def check_t95(value_c) -> list[Violation]:
+    """T95 товарного ДТ ≤ предела (обязательный показатель, ADR-004, ADR-015).
+
+    Как и у серы, отсутствующее или нечисловое значение — нарушение: показатель
+    объявлен организаторами обязательным, поэтому «не измерили» не означает
+    «в пределах нормы».
+    """
+    if not _is_number(value_c):
+        return [Violation("t95", f"нет числового значения T95: {value_c!r}")]
+    if value_c > config.T95_LIMIT_C:
+        return [
+            Violation(
+                "t95",
+                f"T95 {value_c} °C > предела {config.T95_LIMIT_C} °C",
+            )
+        ]
+    return []
+
+
+def check_cetane_number(value) -> list[Violation]:
+    """Цетановое число товарного ДТ ≥ минимума (ADR-004, ADR-015).
+
+    Единственный показатель проекта с ограничением снизу: чем меньше, тем
+    хуже. Отсутствие значения — нарушение на тех же основаниях, что у серы.
+    """
+    if not _is_number(value):
+        return [Violation("cetane_number", f"нет числового значения цетанового числа: {value!r}")]
+    if value < config.CETANE_NUMBER_MIN:
+        return [
+            Violation(
+                "cetane_number",
+                f"цетановое число {value} < минимума {config.CETANE_NUMBER_MIN}",
+            )
+        ]
+    return []
+
+
 def check_blend_fractions(fractions) -> list[Violation]:
     """Доли компонентов блендинга суммируются в 100% и неотрицательны."""
     if not fractions:
@@ -113,6 +150,11 @@ def validate_recommendation(recommendation: dict) -> list[Violation]:
     """
     violations: list[Violation] = []
     violations += check_sulfur(recommendation.get("predicted_sulfur_mg_kg"))
+    # Три обязательных показателя проверяются безусловно, а не «если поле есть»:
+    # организаторы назвали обязательными серу, T95 и цетановое число (ADR-004),
+    # и рекомендация без одного из них не является проверенной рекомендацией.
+    violations += check_t95(recommendation.get("predicted_t95_c"))
+    violations += check_cetane_number(recommendation.get("predicted_cetane_number"))
     violations += check_evidence_type(recommendation.get("evidence_type"))
     if "blend_fractions" in recommendation:
         violations += check_blend_fractions(recommendation["blend_fractions"])

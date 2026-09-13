@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .. import anomaly, config
+from .. import anomaly, config, spec
 from .context import TRAINING_FEATURES, ScenarioContext
 
 BASELINE_MODEL = "shrunk_persistence"
@@ -35,6 +35,7 @@ class QualityAssessment:
     data_confidence: dict
     assumptions: list
     input_anomaly: dict = field(default_factory=dict)
+    spec_indicators: dict = field(default_factory=dict)
     refusal: dict | None = None
     agent: str = field(default="quality", init=False)
 
@@ -48,6 +49,7 @@ class QualityAssessment:
             "training_range": self.training_range,
             "data_confidence": self.data_confidence,
             "input_anomaly": self.input_anomaly,
+            "spec_indicators": self.spec_indicators,
             "assumptions": self.assumptions,
         }
 
@@ -118,6 +120,12 @@ def assess(context: ScenarioContext) -> QualityAssessment:
     snapshot = context.snapshot
     training_range = _training_range(context)
     confidence = _data_confidence(context)
+    # T95 и цетановое число — обязательные показатели наравне с серой (ADR-004).
+    # Считаются до всех ветвлений: даже при отказе от прогноза серы оператор
+    # должен видеть, подтверждены ли они (ADR-015).
+    spec_indicators = spec.resolve_product_indicators(
+        context.long_format, context.issue_time
+    ).to_dict()
     assumptions = [
         "Прогноз серы — сдвинутый persistence: shrinkage · последний "
         "опубликованный анализ ЛИМС «Гидроочистка.2» + (1 − shrinkage) · уровень "
@@ -137,6 +145,15 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         "помечается флагом, и агент оптимизации не строит на нём действий.",
         "Единицы P8/T11/F19 не подтверждены (ADR-007): в data_confidence они "
         "помечены units_confirmed = false, свежесть сигнала доверия к ним не даёт.",
+        f"Пределы T95 ≤ {config.T95_LIMIT_C:g} °C и цетанового числа "
+        f"≥ {config.CETANE_NUMBER_MIN:g} — параметры сценария по ГОСТ 32511-2013 / "
+        "ГОСТ Р 52368 для К5: организаторы назвали эти показатели обязательными, "
+        "но численные пределы оставили на усмотрение команды (ADR-004, ADR-015).",
+        f"T95 и цетановое число берутся измерением из ЛИМС «Гидроочистка.2», а не "
+        f"расчётом по формуле ВАК: ссылка Pipeline в формуле T95 не резолвится "
+        f"(ADR-003). Порог устаревания у них разный — {config.T95_MAX_AGE_HOURS:g} ч "
+        f"для T95 (суточный отбор) и {config.CETANE_MAX_AGE_HOURS / 24:g} суток для "
+        "цетанового числа (p90 интервала между анализами на train — 41.8 суток).",
     ]
     in_range = all(item["in_training_range"] for item in training_range.values())
 
@@ -158,6 +175,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             data_confidence=confidence,
             assumptions=assumptions,
             input_anomaly=input_anomaly,
+            spec_indicators=spec_indicators,
             refusal=refusal,
         )
     if baseline_age is not None and baseline_age > MAX_BASELINE_AGE_HOURS:
@@ -176,6 +194,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             data_confidence=confidence,
             assumptions=assumptions,
             input_anomaly=input_anomaly,
+            spec_indicators=spec_indicators,
             refusal=refusal,
         )
 
@@ -227,4 +246,5 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         data_confidence=confidence,
         assumptions=assumptions,
         input_anomaly=input_anomaly,
+        spec_indicators=spec_indicators,
     )
