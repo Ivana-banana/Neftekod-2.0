@@ -48,8 +48,20 @@ def test_all_seven_sections_are_present(context_kwargs):
 
 def test_card_states_what_is_not_modelled_instead_of_inventing_it():
     text = _card(_context())
-    assert "Влияние на выпуск и энергозатраты не моделируется" in text
+    assert "Влияние на выпуск не моделируется" in text
     assert "Число не выдумывается" in text
+
+
+def test_card_names_the_real_reason_output_is_not_modelled():
+    """Не «данных нет», а «единицы не подтверждены» — расходы в телеметрии есть.
+
+    Прежняя формулировка утверждала отсутствие данных материального баланса,
+    хотя в листе КИП 24-2000 есть и расход продукта, и расход сырья.
+    """
+    text = _card(_context())
+    assert "`F17`" in text and "`T11`" in text
+    assert "единицы этих сигналов организаторами не подтверждены" in text
+    assert "прокси" in text
 
 
 def test_economics_is_marked_as_informational_only():
