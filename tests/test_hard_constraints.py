@@ -34,7 +34,7 @@ class TestT95:
     def test_limit_value_is_allowed(self):
         assert constraints.check_t95(config.T95_LIMIT_C) == []
 
-    @pytest.mark.parametrize("value", [360.0001, 361.0, 370, 400])
+    @pytest.mark.parametrize("value", [360.5, 361.0, 370, 400])
     def test_above_limit_is_violation(self, value):
         assert rules(constraints.check_t95(value)) == {"t95"}
 
@@ -50,7 +50,7 @@ class TestCetaneNumber:
     def test_minimum_value_is_allowed(self):
         assert constraints.check_cetane_number(config.CETANE_NUMBER_MIN) == []
 
-    @pytest.mark.parametrize("value", [50.9999, 50.0, 45, 0])
+    @pytest.mark.parametrize("value", [50.94, 50.0, 45, 0])
     def test_below_minimum_is_violation(self, value):
         assert rules(constraints.check_cetane_number(value)) == {"cetane_number"}
 
@@ -70,12 +70,12 @@ class TestDensity:
     def test_inside_range_is_allowed(self, value):
         assert constraints.check_density(value) == []
 
-    @pytest.mark.parametrize("value", [845.0001, 846.14, 856.2])
+    @pytest.mark.parametrize("value", [845.05, 846.14, 856.2])
     def test_above_maximum_is_violation(self, value):
         """На реальных данных 12 анализов продукта из 1015 выше 845 кг/м³."""
         assert rules(constraints.check_density(value)) == {"density"}
 
-    @pytest.mark.parametrize("value", [819.9999, 800.0, 0.0])
+    @pytest.mark.parametrize("value", [819.94, 800.0, 0.0])
     def test_below_minimum_is_violation(self, value):
         """Слишком лёгкое топливо так же вне спецификации, как слишком тяжёлое."""
         assert rules(constraints.check_density(value)) == {"density"}
@@ -202,3 +202,110 @@ class TestValidateRecommendation:
 
     def test_empty_recommendation_is_rejected(self):
         assert constraints.validate_recommendation({}) != []
+
+
+class TestMeasurementResolution:
+    """Сравнение с пределом — в разрешении наименее точного входа (ADR-017).
+
+    ЛИМС публикует T95 целыми °C, плотность и цетановое число — с шагом 0.1.
+    Превышение меньше половины шага данные не различают, поэтому оно не
+    объявляется нарушением; от половины шага и выше — нарушение.
+    """
+
+    @pytest.mark.parametrize("value", [360.000148, 360.4999])
+    def test_t95_excess_below_half_a_degree_is_not_a_violation(self, value):
+        """Сценарий 4: 360.000148 °C при пределе 360 °C и входе в целых градусах."""
+        assert constraints.check_t95(value) == []
+
+    def test_t95_rounds_half_up(self):
+        assert rules(constraints.check_t95(360.5)) == {"t95"}
+
+    @pytest.mark.parametrize(("value", "allowed"), [(50.95, True), (50.9499, False)])
+    def test_cetane_is_compared_at_a_tenth(self, value, allowed):
+        assert (constraints.check_cetane_number(value) == []) is allowed
+
+    @pytest.mark.parametrize(
+        ("value", "allowed"),
+        [(845.0499, True), (845.05, False), (819.95, True), (819.9499, False)],
+    )
+    def test_density_is_compared_at_a_tenth_on_both_sides(self, value, allowed):
+        assert (constraints.check_density(value) == []) is allowed
+
+    def test_float32_artefact_of_a_lims_value_is_not_a_violation(self):
+        """Реальное значение выгрузки: 845.0 кг/м³, записанное float32."""
+        assert constraints.check_density(845.0000244140625) == []
+
+    def test_sulfur_is_not_rounded(self):
+        """ADR-017 называет T95, вспышку, плотность и ЦЧ; предел серы не трогается."""
+        assert rules(constraints.check_sulfur(10.0001)) == {"sulfur"}
+
+    def test_violation_detail_shows_both_raw_and_compared_value(self):
+        detail = constraints.check_t95(360.6)[0].detail
+        assert "360.6" in detail and "361" in detail
+
+
+class TestUnverifiedVsViolated:
+    """«Не подтверждён» и «нарушен» — разные случаи (ADR-017).
+
+    Нарушение блокирует всё, включая сохранение режима. Неподтверждённый
+    показатель блокирует любое изменение, но не статус-кво.
+    """
+
+    @pytest.mark.parametrize(
+        ("check", "rule"),
+        [
+            (constraints.check_t95, "t95"),
+            (constraints.check_cetane_number, "cetane_number"),
+            (constraints.check_density, "density"),
+        ],
+    )
+    def test_absent_indicator_is_unverified(self, check, rule):
+        [violation] = check(None)
+        assert (violation.rule, violation.kind) == (rule, constraints.UNVERIFIED)
+
+    @pytest.mark.parametrize(
+        ("check", "value"),
+        [
+            (constraints.check_t95, 366.0),
+            (constraints.check_cetane_number, 49.0),
+            (constraints.check_density, 846.2),
+        ],
+    )
+    def test_out_of_limit_indicator_is_violated(self, check, value):
+        [violation] = check(value)
+        assert violation.kind == constraints.VIOLATED
+
+    @pytest.mark.parametrize("value", [float("nan"), "350", "", True])
+    def test_malformed_value_is_violated_not_unverified(self, value):
+        """Мусор в поле — не «анализ не пришёл», льготы статус-кво он не получает."""
+        [violation] = constraints.check_t95(value)
+        assert violation.kind == constraints.VIOLATED
+
+    def test_absent_sulfur_is_violated(self):
+        """Сера — прогноз агента качества, без неё нет и статус-кво."""
+        [violation] = constraints.check_sulfur(None)
+        assert violation.kind == constraints.VIOLATED
+
+    def _hold(self, **overrides):
+        return TestValidateRecommendation()._valid() | overrides
+
+    def test_unverified_indicator_does_not_block_status_quo(self):
+        violations = constraints.validate_recommendation(self._hold(predicted_density_kg_m3=None))
+        assert constraints.blocking(violations, status_quo=True) == []
+        assert constraints.unverified_indicators(violations) == ["density"]
+
+    def test_unverified_indicator_blocks_any_change(self):
+        violations = constraints.validate_recommendation(self._hold(predicted_density_kg_m3=None))
+        assert rules(constraints.blocking(violations, status_quo=False)) == {"density"}
+
+    def test_violated_indicator_blocks_status_quo(self):
+        violations = constraints.validate_recommendation(self._hold(predicted_t95_c=366.0))
+        assert rules(constraints.blocking(violations, status_quo=True)) == {"t95"}
+        assert constraints.unverified_indicators(violations) == []
+
+    def test_unverified_does_not_hide_a_violation_elsewhere(self):
+        """Неподтверждённая плотность не отменяет нарушение серы у того же hold."""
+        violations = constraints.validate_recommendation(
+            self._hold(predicted_density_kg_m3=None, predicted_sulfur_mg_kg=10.4)
+        )
+        assert rules(constraints.blocking(violations, status_quo=True)) == {"sulfur"}

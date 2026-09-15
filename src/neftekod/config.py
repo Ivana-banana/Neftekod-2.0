@@ -66,3 +66,11 @@ DENSITY_MAX_KG_M3 = 845.0
 # компонента заметно реже (p90 = 79.3 суток). См. ADR-016.
 DENSITY_MAX_AGE_HOURS = 48.0
 CUT_DENSITY_MAX_AGE_HOURS = 80 * 24.0
+
+# Разрешение лабораторных значений: с этой точностью прогноз показателя
+# сравнивается с пределом. Измерено на `build/lims_pak_long.csv`: `95%.T` обеих
+# точек и `FlashPoint` — только целые °C; `D15` и `CetaneNumber` — шаг 0.1
+# (длинные хвосты — артефакт float32, |v − round(v, 1)| ≤ 2.5e-5). См. ADR-017.
+T95_RESOLUTION_C = 1.0
+CETANE_NUMBER_RESOLUTION = 0.1
+DENSITY_RESOLUTION_KG_M3 = 0.1

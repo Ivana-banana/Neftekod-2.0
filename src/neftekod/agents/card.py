@@ -200,6 +200,20 @@ def _action_block(decision, submission) -> list[str]:
             f"| доля {name} | {current:.4%} | {share:.4%} | "
             f"{'изменить' if changed else 'без изменений'} |"
         )
+    unverified = recommendation.get("unverified_spec_indicators") or []
+    if unverified:
+        titles = {"t95": "T95", "cetane_number": "цетановое число", "density": "плотность"}
+        lines += [""]
+        lines += [
+            f"- **Обязательный показатель «{titles.get(name, name)}» не подтверждён** — "
+            "соответствие по нему этой рекомендацией не подтверждается."
+            for name in unverified
+        ]
+        lines += [
+            "",
+            "Режим сохраняется, но изменение режима или состава до свежего анализа "
+            "не сертифицируется (ADR-017).",
+        ]
     return lines
 
 

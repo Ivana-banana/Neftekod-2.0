@@ -396,11 +396,24 @@ class TestOptimization:
             assert isinstance(recommendation["predicted_t95_c"], float), candidate["id"]
             assert isinstance(recommendation["predicted_cetane_number"], float), candidate["id"]
 
-    def test_unverified_cetane_blocks_every_candidate(self):
-        """Просроченный обязательный показатель — отказ, а не оговорка.
+    def _assert_only_hold_survives(self, proposal, indicator):
+        """Неподтверждённый показатель: изменения отклонены, hold — с пометкой (ADR-017)."""
+        assert proposal.recommended_id == "hold"
+        assert proposal.refusal is None
+        assert proposal.recommended()["recommendation"]["unverified_spec_indicators"] == [indicator]
+        changes = [item for item in proposal.candidates if item["kind"] != "no_action"]
+        assert changes
+        for candidate in changes:
+            assert not candidate["admissible"], candidate["id"]
+            assert "unverified_spec_indicator" in candidate["rejection_codes"], candidate["id"]
+            assert indicator in " ".join(candidate["rejection_reasons"]), candidate["id"]
+
+    def test_unverified_cetane_blocks_every_change_but_not_hold(self):
+        """Просроченный обязательный показатель — не повод менять режим.
 
         Цетановое число отбирается примерно раз в месяц; анализ старше порога
-        не подставляется как будто он свежий, поэтому сертифицировать нечего.
+        не подставляется как будто он свежий, поэтому сертифицировать изменение
+        нечем. «Ничего не менять» при этом остаётся допустимым (ADR-017).
         """
         stale = str(ISSUE_TIME - pd.Timedelta(hours=config.CETANE_MAX_AGE_HOURS + 24))
         context = _context(long_format=_long_format(cetane_sample=stale))
@@ -410,21 +423,33 @@ class TestOptimization:
         assert assessment.refusal is None
         assert assessment.spec_indicators["cetane_number"]["verified"] is False
         proposal = optimization.propose(context, assessment, reliability.assess(context))
-        assert proposal.recommended_id is None
-        assert proposal.refusal is not None
-        for candidate in proposal.candidates:
-            assert "cetane_number" in " ".join(candidate["rejection_reasons"]), candidate["id"]
-            assert "hard_constraint" in candidate["rejection_codes"], candidate["id"]
+        self._assert_only_hold_survives(proposal, "cetane_number")
 
-    def test_absent_t95_blocks_every_candidate(self):
+    def test_absent_t95_blocks_every_change_but_not_hold(self):
         context = _context(long_format=_long_format(product_t95=None))
         proposal = optimization.propose(
             context, quality.assess(context), reliability.assess(context)
         )
-        assert proposal.recommended_id is None
-        assert all(
-            "t95" in " ".join(candidate["rejection_reasons"]) for candidate in proposal.candidates
+        self._assert_only_hold_survives(proposal, "t95")
+
+    def test_verified_hold_carries_an_explicit_empty_unverified_list(self, scenario_context):
+        """Пустой список — утверждение «всё подтверждено», а не отсутствие поля."""
+        recommended = self._proposal(scenario_context).recommended()
+        assert recommended["recommendation"]["unverified_spec_indicators"] == []
+
+    def test_t95_excess_below_lab_resolution_does_not_reject_hold(self):
+        """Сценарий 4: T95 продукта ровно 360 °C, модельная доля компонента 362 °C.
+
+        Смесь даёт 360.000148 °C — превышение на четыре порядка ниже шага ЛИМС
+        в 1 °C. Такое «нарушение» данные не различают (ADR-017).
+        """
+        context = _context(long_format=_long_format(product_t95=360.0, cut_t95=362.0))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
         )
+        hold = next(item for item in proposal.candidates if item["kind"] == "no_action")
+        assert hold["recommendation"]["predicted_t95_c"] > config.T95_LIMIT_C
+        assert hold["admissible"], hold["rejection_reasons"]
 
     def test_t95_above_limit_rejects_the_blend_even_with_sulfur_headroom(self):
         """Запас по сере не покупает нарушение по T95 (ТЗ, §4)."""
@@ -490,17 +515,13 @@ class TestOptimization:
         assert values
         assert max(values) - min(values) < 0.1
 
-    def test_unverified_cut_density_blocks_every_candidate(self):
-        """Неизмеренная плотность компонента — отказ, а не «возьмём плотность продукта»."""
+    def test_unverified_cut_density_blocks_every_change_but_not_hold(self):
+        """Неизмеренная плотность компонента — не «возьмём плотность продукта»."""
         context = _context(long_format=_long_format(cut_density=None))
         proposal = optimization.propose(
             context, quality.assess(context), reliability.assess(context)
         )
-        assert proposal.recommended_id is None
-        for candidate in proposal.candidates:
-            assert "density" in " ".join(candidate["rejection_reasons"]).lower() or (
-                "плотност" in " ".join(candidate["rejection_reasons"])
-            ), candidate["id"]
+        self._assert_only_hold_survives(proposal, "density")
 
     def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
         """Порог действия берётся по худшему горизонту, на который оно влияет."""
@@ -652,6 +673,73 @@ def _submission(context) -> tuple[dict, dict]:
         "snapshot": context.snapshot,
     }
     return submission, sources
+
+
+def _stale_cetane_context():
+    stale = str(ISSUE_TIME - pd.Timedelta(hours=config.CETANE_MAX_AGE_HOURS + 24))
+    return _context(long_format=_long_format(cetane_sample=stale))
+
+
+class TestOrchestratorUnverified:
+    """«Не подтверждён» ≠ «нарушен» и в независимой проверке (ADR-017)."""
+
+    def test_approves_hold_with_unverified_indicator_and_warns(self):
+        submission, sources = _submission(_stale_cetane_context())
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "approved", decision.rejection_reasons
+        assert decision.recommendation["action"] == "hold"
+        assert decision.recommendation["unverified_spec_indicators"] == ["cetane_number"]
+        assert any("цетанов" in warning for warning in decision.warnings)
+        assert all(check["passed"] for check in decision.checks), decision.checks
+
+    def test_change_with_unverified_indicator_is_rejected(self):
+        context = _stale_cetane_context()
+        quality_assessment = quality.assess(context)
+        reliability_assessment = reliability.assess(context)
+        proposal = optimization.propose(context, quality_assessment, reliability_assessment)
+        submission, sources = _submission(context)
+        blend = next(item for item in proposal.candidates if item["kind"] == "blend")
+        submission["recommendation"] = blend["recommendation"]
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("cetane_number" in reason for reason in decision.rejection_reasons)
+
+    def test_hidden_unverified_indicator_is_rejected(self):
+        """Снять пометку в пакете нельзя: оркестратор выводит её сам."""
+        submission, sources = _submission(_stale_cetane_context())
+        submission["recommendation"]["unverified_spec_indicators"] = []
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(
+            item for item in decision.checks if item["check"] == "unverified_indicators_declared"
+        )
+        assert check["passed"] is False
+
+    def test_violation_cannot_be_disguised_as_unverified(self):
+        """Измеренный T95 366 °C, выданный в пакете за «нет анализа», не проходит.
+
+        Иначе правило ADR-017 открывало бы дыру: убрать число из входа и
+        получить утверждённый hold вместо отказа.
+        """
+        context = _context(long_format=_long_format(product_t95=366.0))
+        quality_assessment = quality.assess(context)
+        reliability_assessment = reliability.assess(context)
+        proposal = optimization.propose(context, quality_assessment, reliability_assessment)
+        assert proposal.recommended_id is None
+        submission, sources = _submission(context)
+        hold = next(item for item in proposal.candidates if item["kind"] == "no_action")
+        submission["recommendation"] = hold["recommendation"] | {
+            "predicted_t95_c": None,
+            "unverified_spec_indicators": ["t95"],
+        }
+        base = submission["input"]["components"]["hydrotreated_diesel"]
+        submission["input"]["components"]["hydrotreated_diesel"] = base | {"t95_c": None}
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(
+            item for item in decision.checks if item["check"] == "component_spec_matches_quality"
+        )
+        assert check["passed"] is False
 
 
 class TestOrchestrator:

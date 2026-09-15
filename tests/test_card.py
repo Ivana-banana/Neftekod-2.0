@@ -134,3 +134,14 @@ def test_density_is_shown_with_its_two_sided_range():
     assert f"{config.DENSITY_MIN_KG_M3:g}–{config.DENSITY_MAX_KG_M3:g}" in text
     assert "Прогноз плотности смеси" in text
     assert "аддитивность объёмов" in text
+
+
+def test_hold_with_unverified_indicator_is_named_next_to_the_action():
+    """Пометка ADR-017 видна в блоке действия, а не только в рисках."""
+    from test_agents import _stale_cetane_context
+
+    text = _card(_stale_cetane_context())
+    action = text.split("## 3. Предлагаемое действие", 1)[1].split("## 4.", 1)[0]
+    assert "Действие: `hold`" in action
+    assert "не подтверждён" in action
+    assert "цетановое число" in action

@@ -42,6 +42,7 @@ RECOMMENDATION_KEYS = frozenset(
         "blend_fractions",
         "setpoints",
         "allowed_ranges",
+        "unverified_spec_indicators",
     }
 )
 APPLIED_CONSTRAINT_KEYS = frozenset(
@@ -63,6 +64,9 @@ APPLIED_CONSTRAINT_KEYS = frozenset(
 SOURCE_KEYS = ("quality", "reliability", "snapshot")
 BLOCKING_QUALITY_RISKS = frozenset({"high", "spec_violation_predicted"})
 SETPOINT_TOLERANCE = 1e-9
+# Показатель спецификации: поле компонента во входе → ключ вывода агента качества.
+SPEC_COMPONENT_KEYS = {"t95_c": "t95", "cetane_number": "cetane_number", "density_kg_m3": "density"}
+SPEC_TITLES = {"t95": "T95", "cetane_number": "цетановое число", "density": "плотность"}
 
 # Что эта проверка не доказывает. Не устная оговорка на демонстрации, а часть
 # машиночитаемого вывода: см. ADR-010 и `.claude/agents/orchestrator.md`.
@@ -79,6 +83,11 @@ REVIEW_LIMITS = (
     "ADR-015, ADR-016), а сами модели историей не проверялись: воспроизводимо "
     "— арифметика, а не физика смешения. Цетановое число дешёвого компонента "
     "вообще не измеряется (допущение).",
+    "Сохранение режима при неподтверждённом показателе утверждается с пометкой "
+    "(ADR-017). Показатели базового компонента сверяются с агентом качества, "
+    "поэтому выдать измеренное нарушение за «нет анализа» нельзя; T95 и "
+    "плотность дешёвого компонента независимого источника у оркестратора не "
+    "имеют и берутся из входа.",
 )
 
 
@@ -184,6 +193,12 @@ def _verify_blended(
     «пропустим проверку», а причина отклонения (ADR-015).
     """
     values, detail = _component_values(components, fractions, key)
+    if values is None and claimed is None:
+        # Показатель не подтверждён ни во входе, ни в рекомендации — это
+        # согласовано. Допустим ли такой вариант, решает `constraints.blocking`
+        # по статус-кво, а не эта сверка (ADR-017).
+        checks.append(_check(name, True, f"показатель не подтверждён, заявлено None: {detail}"))
+        return
     if values is None:
         checks.append(_check(name, False, detail))
         reasons.append(f"показатель смеси не воспроизводится: {detail}")
@@ -327,6 +342,35 @@ def _cross_check_with_roles(
                 f"({base_sulfur!r} мг/кг): пересчёт баланса не спасает, если занижено "
                 "само исходное число"
             )
+        # Показатели спецификации базового компонента — измерения агента
+        # качества. Без этой сверки измеренное нарушение можно выдать за «нет
+        # анализа» и получить утверждённый hold по ADR-017.
+        indicators = quality.get("spec_indicators") or {}
+        measured = {
+            field: (indicators.get(indicator) or {}).get("value")
+            for field, indicator in SPEC_COMPONENT_KEYS.items()
+        }
+        components = scenario_input.get("components") or {}
+        spec_matches = bool(declared) and all(
+            all(
+                (components[name].get(field) is None and value is None)
+                or _close(components[name].get(field), value, 1e-9)
+                for field, value in measured.items()
+            )
+            for name in declared
+        )
+        checks.append(
+            _check(
+                "component_spec_matches_quality",
+                spec_matches,
+                f"T95, ЦЧ и плотность базового компонента сверены с агентом качества: {measured}",
+            )
+        )
+        if not spec_matches:
+            reasons.append(
+                "показатели спецификации базового компонента во входе не совпадают с "
+                "измерениями агента качества — нарушение нельзя выдать за «нет анализа»"
+            )
 
     current = {
         key: snapshot.get(f"{key}_value") for key in (scenario_input.get("current_setpoints") or {})
@@ -383,17 +427,71 @@ def review(submission: dict, *, sources: dict) -> Decision:
     reasons: list = []
     warnings: list = []
 
+    # Статус-кво определяется по фактическим числам, а не по ярлыку `action`:
+    # иначе слово «hold» отключает весь gate ниже. См. ADR-010. Нужен уже здесь:
+    # от него зависит, блокирует ли неподтверждённый показатель (ADR-017).
+    scenario_input = submission["input"]
+    unchanged_setpoints = _same_mapping(
+        recommendation.get("setpoints"), scenario_input.get("current_setpoints")
+    )
+    unchanged_blend = _same_mapping(
+        recommendation.get("blend_fractions"), scenario_input.get("current_blend_fractions")
+    )
+    is_status_quo = unchanged_setpoints and unchanged_blend
+
     violations = constraints.validate_recommendation(recommendation)
+    blocking = constraints.blocking(violations, status_quo=is_status_quo)
     checks.append(
         _check(
             "hard_constraints_recomputed",
-            not violations,
+            not blocking,
             "constraints.validate_recommendation выполнен оркестратором заново на числах "
-            "рекомендации; нарушений: " + str(len(violations)),
+            "рекомендации; блокирующих нарушений: " + str(len(blocking))
+            + f", всего: {len(violations)}, статус-кво: {is_status_quo}",
         )
     )
+    for violation in blocking:
+        if violation.kind == constraints.UNVERIFIED:
+            reasons.append(
+                f"обязательный показатель {violation.rule} не подтверждён, а рекомендация "
+                "меняет режим или состав — изменение не сертифицируется (ADR-017)"
+            )
+        else:
+            reasons.append(f"жёсткое ограничение {violation.rule}: {violation.detail}")
+
+    # Пометку оркестратор выводит сам и сверяет с пакетом: снять её, чтобы
+    # hold выглядел полностью подтверждённым, нельзя.
+    unverified = constraints.unverified_indicators(violations)
+    declared_unverified = recommendation.get("unverified_spec_indicators")
+    marked = isinstance(declared_unverified, list) and sorted(declared_unverified) == unverified
+    checks.append(
+        _check(
+            "unverified_indicators_declared",
+            marked,
+            f"неподтверждённые по пересчёту: {unverified}, заявлено: {declared_unverified!r}",
+        )
+    )
+    if not marked:
+        reasons.append(
+            f"пометка unverified_spec_indicators {declared_unverified!r} не совпадает с "
+            f"пересчитанной оркестратором {unverified}"
+        )
+    indicators = (sources.get("quality") or {}).get("spec_indicators") or {}
     for violation in violations:
-        reasons.append(f"жёсткое ограничение {violation.rule}: {violation.detail}")
+        if violation.kind != constraints.UNVERIFIED or not is_status_quo:
+            continue
+        measured = indicators.get(violation.rule) or {}
+        detail = (
+            measured.get("detail")
+            if measured and not measured.get("verified")
+            else f"показатель смеси не подтверждён: {violation.detail}"
+        )
+        warnings.append(
+            f"обязательный показатель «{SPEC_TITLES.get(violation.rule, violation.rule)}» "
+            f"не подтверждён: {detail}. Режим сохраняется, но соответствие по этому "
+            "показателю не подтверждено, а изменение режима или состава не "
+            "сертифицируется (ADR-017)"
+        )
 
     limit = applied.get("sulfur_limit_mg_kg", config.SULFUR_LIMIT_MG_KG)
     if limit != config.SULFUR_LIMIT_MG_KG:
@@ -510,16 +608,6 @@ def review(submission: dict, *, sources: dict) -> Decision:
     for violation in range_violations:
         reasons.append(f"уставка вне применённого диапазона: {violation.detail}")
 
-    # Статус-кво определяется по фактическим числам, а не по ярлыку `action`:
-    # иначе слово «hold» отключает весь gate ниже. См. ADR-010.
-    scenario_input = submission["input"]
-    unchanged_setpoints = _same_mapping(
-        recommendation.get("setpoints"), scenario_input.get("current_setpoints")
-    )
-    unchanged_blend = _same_mapping(
-        recommendation.get("blend_fractions"), scenario_input.get("current_blend_fractions")
-    )
-    is_status_quo = unchanged_setpoints and unchanged_blend
     action = recommendation.get("action")
     if action == "hold" and not is_status_quo:
         checks.append(

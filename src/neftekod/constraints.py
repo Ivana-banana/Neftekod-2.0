@@ -7,14 +7,17 @@
 
 Модуль намеренно не знает ничего о моделях и агентах: агент оптимизации и
 оркестратор вызывают `validate_recommendation()` и получают список
-нарушений. Пустой список — единственный способ считать рекомендацию
-допустимой.
+нарушений, а `blocking()` отбирает из него те, что отклоняют рекомендацию.
+Единственное различие — неподтверждённый показатель не блокирует сохранение
+текущего режима (ADR-017); для любого изменения пустой список остаётся
+единственным способом считать рекомендацию допустимой.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 
 from . import config
 
@@ -23,15 +26,42 @@ from . import config
 # ещё не случавшегося действия.
 EVIDENCE_TYPES = frozenset({"backtested", "simulated_unvalidated"})
 
+# «Нарушен» и «не подтверждён» — разные случаи (ADR-017). Нарушение — число вне
+# предела или мусор в поле: отклоняется всё, включая сохранение режима.
+# Неподтверждённый показатель — числа нет, потому что анализ просрочен,
+# отсутствует или нефизичен: отклоняется любое изменение, статус-кво допустим
+# с явной пометкой.
+VIOLATED = "violated"
+UNVERIFIED = "unverified"
+
 
 @dataclass(frozen=True)
 class Violation:
     rule: str
     detail: str
+    kind: str = VIOLATED
 
 
 def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isnan(value)
+
+
+def _at_resolution(value: float, step: float) -> float:
+    """Округлить до шага разрешения входа, половина — вверх (ADR-017).
+
+    Через Decimal от repr, а не через `round()`: встроенное округление
+    банковское и работает с двоичным представлением, из-за чего 50.95 могло бы
+    оказаться то 51.0, то 50.9.
+    """
+    quantum = Decimal(repr(float(step)))
+    steps = (Decimal(repr(float(value))) / quantum).quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    return float(steps * quantum)
+
+
+def _unverified(rule: str, title: str) -> list[Violation]:
+    return [
+        Violation(rule, f"{title} не подтверждён анализом: числа нет", kind=UNVERIFIED)
+    ]
 
 
 def check_sulfur(value_mg_kg) -> list[Violation]:
@@ -56,17 +86,21 @@ def check_sulfur(value_mg_kg) -> list[Violation]:
 def check_t95(value_c) -> list[Violation]:
     """T95 товарного ДТ ≤ предела (обязательный показатель, ADR-004, ADR-015).
 
-    Как и у серы, отсутствующее или нечисловое значение — нарушение: показатель
-    объявлен организаторами обязательным, поэтому «не измерили» не означает
-    «в пределах нормы».
+    Отсутствующее значение (`None`) — неподтверждённый показатель, нечисловое —
+    нарушение: «не измерили» не означает «в пределах нормы». С пределом
+    сравнивается значение в разрешении входа — целых °C (ADR-017).
     """
+    if value_c is None:
+        return _unverified("t95", "T95")
     if not _is_number(value_c):
         return [Violation("t95", f"нет числового значения T95: {value_c!r}")]
-    if value_c > config.T95_LIMIT_C:
+    compared = _at_resolution(value_c, config.T95_RESOLUTION_C)
+    if compared > config.T95_LIMIT_C:
         return [
             Violation(
                 "t95",
-                f"T95 {value_c} °C > предела {config.T95_LIMIT_C} °C",
+                f"T95 {value_c} °C (в разрешении {config.T95_RESOLUTION_C:g} °C: "
+                f"{compared:g}) > предела {config.T95_LIMIT_C} °C",
             )
         ]
     return []
@@ -76,15 +110,20 @@ def check_cetane_number(value) -> list[Violation]:
     """Цетановое число товарного ДТ ≥ минимума (ADR-004, ADR-015).
 
     Единственный показатель проекта с ограничением снизу: чем меньше, тем
-    хуже. Отсутствие значения — нарушение на тех же основаниях, что у серы.
+    хуже. Отсутствие значения — неподтверждённый показатель; сравнение — в
+    разрешении 0.1 (ADR-017).
     """
+    if value is None:
+        return _unverified("cetane_number", "цетановое число")
     if not _is_number(value):
         return [Violation("cetane_number", f"нет числового значения цетанового числа: {value!r}")]
-    if value < config.CETANE_NUMBER_MIN:
+    compared = _at_resolution(value, config.CETANE_NUMBER_RESOLUTION)
+    if compared < config.CETANE_NUMBER_MIN:
         return [
             Violation(
                 "cetane_number",
-                f"цетановое число {value} < минимума {config.CETANE_NUMBER_MIN}",
+                f"цетановое число {value} (в разрешении {config.CETANE_NUMBER_RESOLUTION:g}: "
+                f"{compared:g}) < минимума {config.CETANE_NUMBER_MIN}",
             )
         ]
     return []
@@ -95,15 +134,20 @@ def check_density(value_kg_m3) -> list[Violation]:
 
     Единственная проверка проекта с ограничением **с двух сторон**: и слишком
     лёгкое, и слишком тяжёлое топливо не соответствует спецификации. Как и у
-    остальных обязательных показателей, отсутствующее значение — нарушение.
+    остальных обязательных показателей, отсутствующее значение — неподтверждённый
+    показатель; сравнение — в разрешении 0.1 кг/м³ (ADR-017).
     """
+    if value_kg_m3 is None:
+        return _unverified("density", "плотность")
     if not _is_number(value_kg_m3):
         return [Violation("density", f"нет числового значения плотности: {value_kg_m3!r}")]
-    if value_kg_m3 < config.DENSITY_MIN_KG_M3 or value_kg_m3 > config.DENSITY_MAX_KG_M3:
+    compared = _at_resolution(value_kg_m3, config.DENSITY_RESOLUTION_KG_M3)
+    if compared < config.DENSITY_MIN_KG_M3 or compared > config.DENSITY_MAX_KG_M3:
         return [
             Violation(
                 "density",
-                f"плотность {value_kg_m3} кг/м³ вне диапазона "
+                f"плотность {value_kg_m3} кг/м³ (в разрешении "
+                f"{config.DENSITY_RESOLUTION_KG_M3:g}: {compared:g}) вне диапазона "
                 f"{config.DENSITY_MIN_KG_M3}–{config.DENSITY_MAX_KG_M3} кг/м³",
             )
         ]
@@ -166,7 +210,8 @@ def validate_recommendation(recommendation: dict) -> list[Violation]:
     """Все жёсткие проверки разом. Пустой список — рекомендация допустима.
 
     Проверки не складываются в «в целом приемлемо»: любое нарушение
-    отклоняет рекомендацию целиком.
+    отклоняет рекомендацию целиком. Исключение одно и выносится в `blocking()`:
+    неподтверждённый показатель у статус-кво (ADR-017).
     """
     violations: list[Violation] = []
     violations += check_sulfur(recommendation.get("predicted_sulfur_mg_kg"))
@@ -185,3 +230,20 @@ def validate_recommendation(recommendation: dict) -> list[Violation]:
             recommendation["setpoints"], recommendation.get("allowed_ranges")
         )
     return violations
+
+
+def blocking(violations: list[Violation], *, status_quo: bool) -> list[Violation]:
+    """Нарушения, которые отклоняют рекомендацию (ADR-017).
+
+    Для изменения режима или состава блокирует всё. Для статус-кво
+    неподтверждённый показатель не блокирует: «ничего не менять» не требует
+    сертифицировать то, чего лаборатория ещё не выдала. Доказанное нарушение
+    блокирует и статус-кво. Что считать статус-кво, решает вызывающий — по
+    фактическим уставкам и составу, а не по ярлыку `action`.
+    """
+    return [v for v in violations if not (status_quo and v.kind == UNVERIFIED)]
+
+
+def unverified_indicators(violations: list[Violation]) -> list[str]:
+    """Имена неподтверждённых показателей — для пометки в рекомендации."""
+    return sorted({v.rule for v in violations if v.kind == UNVERIFIED})

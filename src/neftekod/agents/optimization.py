@@ -43,6 +43,7 @@ REJECTION_CODES = (
     "regime_inadmissible",
     "anomalous_input",
     "unmodelled_spec_effect",
+    "unverified_spec_indicator",
 )
 
 
@@ -252,6 +253,12 @@ def _candidate(
     effect_model: dict | None,
 ) -> dict:
     violations = constraints.validate_recommendation(recommendation)
+    # Неподтверждённый показатель не блокирует статус-кво, но блокирует любое
+    # изменение; доказанное нарушение блокирует всё. Пометка кладётся в саму
+    # рекомендацию у каждого кандидата: пустой список — это утверждение «всё
+    # подтверждено», а не пропущенное поле. См. ADR-017.
+    blocking = constraints.blocking(violations, status_quo=kind == "no_action")
+    recommendation["unverified_spec_indicators"] = constraints.unverified_indicators(violations)
     return {
         "id": identifier,
         "kind": kind,
@@ -260,13 +267,25 @@ def _candidate(
         "objective": objective,
         "effect_model": effect_model,
         "hard_constraint_violations": [
-            {"rule": violation.rule, "detail": violation.detail} for violation in violations
+            {"rule": violation.rule, "detail": violation.detail, "kind": violation.kind}
+            for violation in violations
         ],
-        "admissible": not violations,
+        "admissible": not blocking,
         "rejection_reasons": [
-            f"жёсткое ограничение {violation.rule}: {violation.detail}" for violation in violations
+            (
+                f"обязательный показатель {violation.rule} не подтверждён: изменение "
+                f"режима или состава не сертифицируется ({violation.detail})"
+                if violation.kind == constraints.UNVERIFIED
+                else f"жёсткое ограничение {violation.rule}: {violation.detail}"
+            )
+            for violation in blocking
         ],
-        "rejection_codes": ["hard_constraint"] * len(violations),
+        "rejection_codes": [
+            "unverified_spec_indicator"
+            if violation.kind == constraints.UNVERIFIED
+            else "hard_constraint"
+            for violation in blocking
+        ],
     }
 
 
@@ -309,8 +328,16 @@ def propose(
         f"цетановое число ≥ {config.CETANE_NUMBER_MIN:g}; к ним добавлена плотность "
         f"{config.DENSITY_MIN_KG_M3:g}–{config.DENSITY_MAX_KG_M3:g} кг/м³ — "
         "нормируемый ГОСТ показатель на той же точке отбора (ADR-016). Показатель, не "
-        "подтверждённый свежим анализом, не считается выполненным: кандидат "
-        "отклоняется жёстким ограничением, а не проходит с оговоркой (ADR-015).",
+        "подтверждённый свежим анализом, не считается выполненным: любое изменение "
+        "режима или состава отклоняется кодом unverified_spec_indicator, а сохранение "
+        "текущего режима остаётся допустимым с явной пометкой "
+        "unverified_spec_indicators (ADR-015, ADR-017). Доказанное нарушение "
+        "отклоняет и сохранение режима.",
+        f"Прогноз показателя сравнивается с пределом в разрешении лабораторного "
+        f"входа: T95 — {config.T95_RESOLUTION_C:g} °C, цетановое число — "
+        f"{config.CETANE_NUMBER_RESOLUTION:g}, плотность — "
+        f"{config.DENSITY_RESOLUTION_KG_M3:g} кг/м³; превышение меньше половины шага "
+        "данные не различают (ADR-017).",
         "Влияние изменения уставок P8/T11/F19 на T95 и цетановое число не "
         "моделируется: модели нет, а подставлять текущее измерение как прогноз "
         "после действия нельзя. Поэтому кандидат, меняющий уставки, отклоняется "
