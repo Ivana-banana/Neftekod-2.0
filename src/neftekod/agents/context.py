@@ -7,12 +7,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
-from .. import config, features
+from .. import config, features, telemetry_defects
 
 TRAINING_FEATURES = ("lims_value", "pak_value", "P8_value", "T11_value", "F19_value")
 
@@ -29,6 +29,8 @@ class ScenarioContext:
     backtest: dict
     long_format: pd.DataFrame
     telemetry: pd.DataFrame
+    # Сколько значений маскировано как дефект на train и в окне, см. ADR-018.
+    telemetry_defects: dict = field(default_factory=dict)
 
 
 def _stats(values: pd.Series) -> dict:
@@ -148,11 +150,24 @@ def load_context(
             config.LONG_FORMAT_CSV, parse_dates=["timestamp", "available_at", "first_seen"]
         )
     if telemetry is None:
-        telemetry = features.load_telemetry()
+        telemetry = features.load_raw_telemetry()
+    raw_telemetry = features._parse_telemetry(telemetry, features.TELEMETRY_TAGS)
     telemetry = features._normalize_telemetry(telemetry, features.TELEMETRY_TAGS)
 
     stamps = pd.to_datetime(telemetry["timestamp"])
-    window_telemetry = telemetry[(stamps >= start) & (stamps <= issue)].copy()
+    in_window = (stamps >= start) & (stamps <= issue)
+    window_telemetry = telemetry[in_window].copy()
+    # Маски считаются по всему ряду и только потом режутся: залипание,
+    # начавшееся до окна, должно быть видно и внутри окна.
+    masks = telemetry_defects.defect_masks(raw_telemetry, features.TELEMETRY_TAGS)
+    in_train = stamps <= pd.Timestamp(config.TRAIN_END)
+    defects = {
+        part: {
+            tag: {code: int(masks[code][tag][rows].sum()) for code in telemetry_defects.DEFECT_CODES}
+            for tag in features.TELEMETRY_TAGS
+        }
+        for part, rows in (("train", in_train), ("window", in_window))
+    }
     quality_stamps = pd.to_datetime(long_format["timestamp"])
     available = pd.to_datetime(long_format["available_at"])
     # В окно попадают только опубликованные к моменту выдачи анализы: проба,
@@ -175,4 +190,5 @@ def load_context(
         backtest=backtest if backtest is not None else load_backtest(),
         long_format=long_format,
         telemetry=telemetry,
+        telemetry_defects=defects,
     )

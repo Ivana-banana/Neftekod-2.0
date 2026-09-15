@@ -50,6 +50,7 @@ class ReliabilityAssessment:
     allowed_ranges_basis: str
     assumptions: list
     refusal: dict | None = None
+    telemetry_defects: dict = field(default_factory=dict)
     agent: str = field(default="reliability", init=False)
 
     def to_dict(self) -> dict:
@@ -65,6 +66,7 @@ class ReliabilityAssessment:
             "allowed_ranges": self.allowed_ranges,
             "allowed_ranges_basis": self.allowed_ranges_basis,
             "assumptions": self.assumptions,
+            "telemetry_defects": self.telemetry_defects,
         }
 
 
@@ -111,6 +113,9 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
         "Границы allowed_ranges — консервативный модельный диапазон по "
         "истории обучения. Это допущение для эксперимента, а не промышленный "
         "предел (ТЗ, §4, «Правило границ»).",
+        "Значение ровно 307.0 и сигнал, повторивший одно число 6 строк подряд, "
+        "считаются дефектом датчика и не используются как измерение (ADR-018). "
+        "Отрицательные значения дефектом не считаются: они совпадают с простоем.",
     ]
     unusable = []
     for tag in features.TELEMETRY_TAGS:
@@ -147,6 +152,7 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
                 "reason": f"нет актуальных значений сигналов: {'; '.join(unusable)}",
                 "rule": "риск-скор «на глаз» при нехватке данных не выдаётся",
             },
+            telemetry_defects=context.telemetry_defects,
         )
 
     signals: dict = {}
@@ -193,6 +199,12 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
                 "внутри окна — короткий бросок, не видимый в std за всё окно"
             )
 
+    for tag, counts in context.telemetry_defects.get("window", {}).items():
+        if any(counts.values()):
+            risk_factors.append(
+                f"{tag}: в окне {counts} значений маскировано как дефект датчика (ADR-018)"
+            )
+
     severity = min(1.0, max(excursions) + max(instabilities))
     return ReliabilityAssessment(
         issue_time=str(context.issue_time),
@@ -204,4 +216,5 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
         allowed_ranges=allowed_ranges,
         allowed_ranges_basis=basis,
         assumptions=assumptions,
+        telemetry_defects=context.telemetry_defects,
     )

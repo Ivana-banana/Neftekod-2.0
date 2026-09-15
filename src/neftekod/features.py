@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import config, splits
+from . import config, splits, telemetry_defects
 
 TARGET_TAG = "LIMS:Гидроочистка.2.Mg.Sulfur"
 PAK_SULFUR_TAG = "24-2000:Mg.Sulfur"
@@ -53,7 +53,16 @@ def load_telemetry(
 
     В CSV временной ключ называется date. Большие исходные файлы не
     изменяются; чтение ограничено выбранными управляющими сигналами.
+    Дефекты датчиков уже заменены пропусками (ADR-018).
     """
+    return telemetry_defects.mask_defects(load_raw_telemetry(path, tags), tags)
+
+
+def load_raw_telemetry(
+    path: Path | None = None,
+    tags: tuple[str, ...] = TELEMETRY_TAGS,
+) -> pd.DataFrame:
+    """То же без маскирования дефектов: чтобы их посчитать, см. ADR-018."""
     source = path or config.HT_TELEMETRY_CSV
     if not source.exists():
         raise FileNotFoundError(f"нет файла телеметрии: {source}")
@@ -64,10 +73,15 @@ def load_telemetry(
     if missing:
         raise ValueError(f"в телеметрии нет тегов: {sorted(missing)}")
     frame = pd.read_csv(source, usecols=["date", *tags])
-    return _normalize_telemetry(frame, tags)
+    return _parse_telemetry(frame, tags)
 
 
 def _normalize_telemetry(frame: pd.DataFrame, tags: tuple[str, ...]) -> pd.DataFrame:
+    # Маркер 307.0 и залипший сигнал становятся пропуском до as-of, см. ADR-018.
+    return telemetry_defects.mask_defects(_parse_telemetry(frame, tags), tags)
+
+
+def _parse_telemetry(frame: pd.DataFrame, tags: tuple[str, ...]) -> pd.DataFrame:
     result = frame.copy()
     if "timestamp" not in result.columns:
         if "date" not in result.columns:

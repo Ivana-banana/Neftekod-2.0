@@ -77,7 +77,12 @@ def _telemetry(values: dict | None = None) -> pd.DataFrame:
     ramp = pd.Series(range(len(train)), dtype=float) / max(len(train) - 1, 1)
     for tag, (low, high) in {"P8": (0.1, 0.3), "T11": (340.0, 380.0), "F19": (150.0, 250.0)}.items():
         current = (values or {}).get(tag, (low + high) / 2)
-        frame[tag] = list(low + ramp * (high - low)) + [current] * len(window)
+        # Живой сигнал не стоит на одном числе: ровная константа в окне —
+        # это залипание, и детектор ADR-018 превратил бы её в пропуск.
+        jitter = (high - low) * 1e-7
+        frame[tag] = list(low + ramp * (high - low)) + [
+            current + (jitter if index % 2 else 0.0) for index in range(len(window))
+        ]
     return frame
 
 
@@ -319,6 +324,17 @@ class TestReliability:
         assessment = reliability.assess(_context(telemetry=telemetry))
         assert assessment.refusal is None
         assert any("скорост" in factor for factor in assessment.risk_factors)
+
+    def test_telemetry_defects_are_published_with_train_and_window_counts(self):
+        """Маркер 307.0 в окне не молчит: он в выводе агента и в факторах риска."""
+        telemetry = _telemetry()
+        window = telemetry.index[telemetry["timestamp"] >= WINDOW_START]
+        telemetry.loc[window[len(window) // 2], "F19"] = 307.0
+        telemetry.loc[telemetry.index[3], "T11"] = 307.0
+        output = reliability.assess(_context(telemetry=telemetry)).to_dict()
+        assert output["telemetry_defects"]["window"]["F19"] == {"sentinel": 1, "frozen": 0}
+        assert output["telemetry_defects"]["train"]["T11"] == {"sentinel": 1, "frozen": 0}
+        assert any("ADR-018" in factor and "F19" in factor for factor in output["risk_factors"])
 
     def test_admissibility_threshold_is_declared_as_assumption(self, scenario_context):
         assessment = reliability.assess(scenario_context)
