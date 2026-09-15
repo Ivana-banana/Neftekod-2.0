@@ -1,4 +1,6 @@
-"""Показатели спецификации помимо серы: T95 и цетановое число (ADR-015).
+"""Показатели спецификации помимо серы: T95, цетановое число, плотность.
+
+См. ADR-015 (T95 и ЦЧ) и ADR-016 (плотность).
 
 Проверка идёт на реальном `lims_export_2023.xlsx`, а не на синтетике: весь
 смысл этих показателей в том, что они измеряются редко, с разной частотой и
@@ -9,7 +11,7 @@
 import pandas as pd
 import pytest
 
-from neftekod import config, spec
+from neftekod import config, constraints, spec
 
 ISSUE_STABLE = "2026-02-04 12:00:00"
 ISSUE_QUALITY_RISK = "2026-05-12 14:00:00"
@@ -167,3 +169,76 @@ class TestBlendModels:
         index = spec.blend_cetane_number(fractions, values)
         linear = (1.0 - fraction) * values["base"] + fraction * values["cut"]
         assert abs(index - linear) < 1e-4
+
+
+class TestDensityBlending:
+    def test_volume_additivity_not_linear_average(self):
+        """1/ρ = Σ wᵢ/ρᵢ — не среднее плотностей (ADR-004, ADR-016)."""
+        fractions = {"base": 0.5, "cut": 0.5}
+        values = {"base": 820.0, "cut": 860.0}
+        blended = spec.blend_density(fractions, values)
+        linear = 840.0
+        assert blended < linear
+        assert blended == pytest.approx(1.0 / (0.5 / 820.0 + 0.5 / 860.0), rel=1e-12)
+
+    def test_single_component_returns_its_own_density(self):
+        assert spec.blend_density({"base": 1.0}, {"base": 836.1}) == pytest.approx(836.1)
+
+    def test_unknown_component_gives_no_value(self):
+        assert spec.blend_density({"a": 0.9, "b": 0.1}, {"a": 836.0, "b": None}) is None
+
+    def test_denser_component_raises_blend_density(self):
+        """Дешёвый компонент плотнее продукта, значит двигает смесь к пределу."""
+        light = spec.blend_density({"base": 1.0, "cut": 0.0}, {"base": 836.0, "cut": 847.0})
+        heavy = spec.blend_density({"base": 0.9, "cut": 0.1}, {"base": 836.0, "cut": 847.0})
+        assert heavy > light
+
+
+class TestDensityOnRealData:
+    def test_density_publishes_less_reliably_than_sulfur(self, lims_long):
+        """Плотность отбирается суточно, но публикуется заметно хуже.
+
+        На момент выдачи сценария 1 последний анализ плотности старше 48 ч,
+        тогда как сера там свежая (26 ч). Это не дефект порога, а свойство
+        данных, и система обязана сказать «не подтверждено», а не подставить
+        значение двухсуточной давности как свежее. Последствия — в ADR-016.
+        """
+        measured = spec.resolve_measured(
+            lims_long,
+            ISSUE_STABLE,
+            spec.BASE_DENSITY_TAG,
+            max_age_hours=config.DENSITY_MAX_AGE_HOURS,
+            min_physical=spec.MIN_PHYSICAL_DENSITY_KG_M3,
+        )
+        assert not measured.verified
+        assert measured.value is None
+        assert measured.age_hours == pytest.approx(50.0)
+
+    def test_density_is_verified_where_the_analysis_is_fresh(self, lims_long):
+        """Порог не запрещает показатель вообще: на свежем анализе он проходит."""
+        measured = spec.resolve_measured(
+            lims_long,
+            ISSUE_FULL_CYCLE,
+            spec.BASE_DENSITY_TAG,
+            max_age_hours=config.DENSITY_MAX_AGE_HOURS,
+            min_physical=spec.MIN_PHYSICAL_DENSITY_KG_M3,
+        )
+        assert measured.verified
+        assert measured.unit == "кг/м3"
+        assert config.DENSITY_MIN_KG_M3 <= measured.value <= config.DENSITY_MAX_KG_M3
+
+    def test_real_product_samples_exceed_the_gost_maximum(self, lims_long):
+        """Ограничение не декоративное: на реальных данных оно нарушается."""
+        part = lims_long[lims_long["tag"].eq(spec.BASE_DENSITY_TAG)].copy()
+        part["value"] = pd.to_numeric(part["value"], errors="coerce")
+        above = part[part["value"] > config.DENSITY_MAX_KG_M3]
+        assert len(above) > 0
+        assert constraints.check_density(float(above["value"].iloc[0])) != []
+
+    def test_cut_component_is_denser_than_the_product(self, lims_long):
+        """Причина, по которой плотность ограничивает долю дешёвого компонента."""
+        def median(tag):
+            part = lims_long[lims_long["tag"].eq(tag)].copy()
+            return pd.to_numeric(part["value"], errors="coerce").median()
+
+        assert median(spec.CUT_DENSITY_TAG) > median(spec.BASE_DENSITY_TAG)

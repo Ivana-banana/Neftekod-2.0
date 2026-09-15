@@ -306,7 +306,9 @@ def propose(
         "сера компонента берётся из реального анализа сырья (ADR-013).",
         "Обязательных показателей товарного ДТ три, а не один (ADR-004): сера "
         f"≤ {config.SULFUR_LIMIT_MG_KG:g} мг/кг, T95 ≤ {config.T95_LIMIT_C:g} °C и "
-        f"цетановое число ≥ {config.CETANE_NUMBER_MIN:g}. Показатель, не "
+        f"цетановое число ≥ {config.CETANE_NUMBER_MIN:g}; к ним добавлена плотность "
+        f"{config.DENSITY_MIN_KG_M3:g}–{config.DENSITY_MAX_KG_M3:g} кг/м³ — "
+        "нормируемый ГОСТ показатель на той же точке отбора (ADR-016). Показатель, не "
         "подтверждённый свежим анализом, не считается выполненным: кандидат "
         "отклоняется жёстким ограничением, а не проходит с оговоркой (ADR-015).",
         "Влияние изменения уставок P8/T11/F19 на T95 и цетановое число не "
@@ -321,6 +323,9 @@ def propose(
     cut = resolve_cut_sulfur(context, blending)
     # T95 дешёвого компонента — тоже измерение, а не допущение (ADR-015).
     cut_t95 = spec.resolve_cut_t95(context.long_format, context.issue_time)
+    # Плотность дешёвого компонента тоже измеряется (ADR-016); он плотнее
+    # продукта, поэтому его доля двигает плотность смеси к верхней границе.
+    cut_density = spec.resolve_cut_density(context.long_format, context.issue_time)
     if quality.refusal is not None or reliability.refusal is not None or cut["refusal"] is not None:
         reasons = [
             item["reason"]
@@ -334,7 +339,7 @@ def propose(
             decision_rules=decision_rules,
             mock_notices=mock_notices,
             blending_inputs=cut,
-            spec_inputs={"cut_t95": cut_t95.to_dict()},
+            spec_inputs={"cut_t95": cut_t95.to_dict(), "cut_density": cut_density.to_dict()},
             refusal={
                 "reason": "; ".join(reasons),
                 "rule": (
@@ -383,6 +388,10 @@ def propose(
         blending.base_component: (product_indicators.get("cetane_number") or {}).get("value"),
         blending.cut_component: blending.cut_cetane_number,
     }
+    component_density = {
+        blending.base_component: (product_indicators.get("density") or {}).get("value"),
+        blending.cut_component: cut_density.value,
+    }
 
     def blend_t95(fraction: float):
         return spec.blend_t95(fractions_of(fraction), component_t95)
@@ -390,14 +399,28 @@ def propose(
     def blend_cetane(fraction: float):
         return spec.blend_cetane_number(fractions_of(fraction), component_cetane)
 
+    def blend_density(fraction: float):
+        return spec.blend_density(fractions_of(fraction), component_density)
+
     def spec_margins(fraction: float) -> dict:
         t95 = blend_t95(fraction)
         cetane = blend_cetane(fraction)
+        density = blend_density(fraction)
         return {
             "t95_c": t95,
             "t95_margin_c": None if t95 is None else config.T95_LIMIT_C - t95,
             "cetane_number": cetane,
             "cetane_margin": None if cetane is None else cetane - config.CETANE_NUMBER_MIN,
+            "density_kg_m3": density,
+            # Диапазон двусторонний, поэтому запас — до ближайшей границы.
+            "density_margin_kg_m3": (
+                None
+                if density is None
+                else min(
+                    config.DENSITY_MAX_KG_M3 - density,
+                    density - config.DENSITY_MIN_KG_M3,
+                )
+            ),
         }
 
     def cost_proxy(fraction: float) -> float:
@@ -429,6 +452,7 @@ def propose(
                 "predicted_sulfur_mg_kg": blend_sulfur(current_fraction),
                 "predicted_t95_c": blend_t95(current_fraction),
                 "predicted_cetane_number": blend_cetane(current_fraction),
+                "predicted_density_kg_m3": blend_density(current_fraction),
                 # Даже «ничего не менять» здесь — не чисто измеренное число:
                 # прогноз базового компонента backtested, но текущая доля
                 # дешёвого компонента модельная (ADR-004), поэтому сера смеси
@@ -469,6 +493,7 @@ def propose(
                     "predicted_sulfur_mg_kg": blend_sulfur(fraction),
                     "predicted_t95_c": blend_t95(fraction),
                     "predicted_cetane_number": blend_cetane(fraction),
+                    "predicted_density_kg_m3": blend_density(fraction),
                     "evidence_type": "simulated_unvalidated",
                     "blend_fractions": fractions_of(fraction),
                     "setpoints": dict(current_setpoints),
@@ -498,6 +523,10 @@ def propose(
                     ),
                     "cut_cetane_number": blending.cut_cetane_number,
                     "cut_cetane_basis": spec.CUT_CETANE_BASIS,
+                    "density_model": "1/ρ_blend = Σ wᵢ/ρᵢ (аддитивность объёмов, ADR-016)",
+                    "cut_density_kg_m3": cut_density.value,
+                    "cut_density_source": cut_density.tag,
+                    "cut_density_age_hours": cut_density.age_hours,
                     "evidence_type": "simulated_unvalidated",
                     "note": (
                         "балансная модель смешения на измеренной сере компонента; "
@@ -538,6 +567,7 @@ def propose(
                             # ниже отклоняется кодом unmodelled_spec_effect.
                             "predicted_t95_c": blend_t95(current_fraction),
                             "predicted_cetane_number": blend_cetane(current_fraction),
+                            "predicted_density_kg_m3": blend_density(current_fraction),
                             "evidence_type": "simulated_unvalidated",
                             "blend_fractions": fractions_of(current_fraction),
                             "setpoints": setpoints,
@@ -609,7 +639,7 @@ def propose(
             decision_rules=decision_rules,
             mock_notices=mock_notices,
             blending_inputs=cut,
-            spec_inputs={"cut_t95": cut_t95.to_dict()},
+            spec_inputs={"cut_t95": cut_t95.to_dict(), "cut_density": cut_density.to_dict()},
             refusal={
                 "reason": "ни один кандидат не прошёл проверки",
                 "rule": "при отсутствии допустимого варианта рекомендация не выдаётся (ТЗ, §4)",
@@ -626,7 +656,7 @@ def propose(
         decision_rules=decision_rules,
         mock_notices=mock_notices,
         blending_inputs=cut,
-        spec_inputs={"cut_t95": cut_t95.to_dict()},
+        spec_inputs={"cut_t95": cut_t95.to_dict(), "cut_density": cut_density.to_dict()},
     )
 
 
@@ -648,6 +678,9 @@ def build_submission(
     recommended = proposal.recommended()
     cut = proposal.blending_inputs or resolve_cut_sulfur(context, blending)
     cut_t95 = ((proposal.spec_inputs or {}).get("cut_t95")) or spec.resolve_cut_t95(
+        context.long_format, context.issue_time
+    ).to_dict()
+    cut_density = ((proposal.spec_inputs or {}).get("cut_density")) or spec.resolve_cut_density(
         context.long_format, context.issue_time
     ).to_dict()
     product = quality.spec_indicators or {}
@@ -677,6 +710,7 @@ def build_submission(
                     # качества; оркестратор пересчитывает по ним смесь сам.
                     "t95_c": (product.get("t95") or {}).get("value"),
                     "cetane_number": (product.get("cetane_number") or {}).get("value"),
+                    "density_kg_m3": (product.get("density") or {}).get("value"),
                 },
                 blending.cut_component: {
                     "sulfur_mg_kg": cut["value_mg_kg"],
@@ -687,6 +721,7 @@ def build_submission(
                     "evidence_type": "backtested",
                     "t95_c": cut_t95.get("value"),
                     "cetane_number": blending.cut_cetane_number,
+                    "density_kg_m3": cut_density.get("value"),
                 },
             },
             "current_setpoints": {
@@ -704,6 +739,8 @@ def build_submission(
             "sulfur_limit_mg_kg": config.SULFUR_LIMIT_MG_KG,
             "t95_limit_c": config.T95_LIMIT_C,
             "cetane_number_min": config.CETANE_NUMBER_MIN,
+            "density_min_kg_m3": config.DENSITY_MIN_KG_M3,
+            "density_max_kg_m3": config.DENSITY_MAX_KG_M3,
             "blend_fraction_sum": config.BLEND_FRACTION_SUM,
             "allowed_ranges": reliability.allowed_ranges,
             "allowed_ranges_basis": reliability.allowed_ranges_basis,

@@ -91,6 +91,8 @@ def _long_format(
     cut_t95: float | None = 356.0,
     product_cetane: float | None = 53.0,
     cetane_sample: str = "2026-01-20 10:00:00",
+    product_density: float | None = 836.0,
+    cut_density: float | None = 847.0,
 ) -> pd.DataFrame:
     """ЛИМС «Гидроочистка.2», ПАК, сера сырья и показатели спецификации.
 
@@ -158,6 +160,8 @@ def _long_format(
         (spec.BASE_T95_TAG, product_t95, last_sample),
         (spec.CUT_T95_TAG, cut_t95, last_sample),
         (spec.BASE_CETANE_TAG, product_cetane, cetane_sample),
+        (spec.BASE_DENSITY_TAG, product_density, last_sample),
+        (spec.CUT_DENSITY_TAG, cut_density, feed_sample),
     ):
         if value is None:
             continue
@@ -451,6 +455,53 @@ class TestOptimization:
             assert "unmodelled_spec_effect" in candidate["rejection_codes"], candidate["id"]
             assert not candidate["admissible"]
 
+    def test_product_density_above_the_range_rejects_every_candidate(self):
+        """Реальный связывающий случай: измеренная плотность продукта вне ГОСТ.
+
+        На выгрузке так происходит 12 раз из 1015. Тогда недопустим и `hold`:
+        система не подтверждает соответствие, которого нет.
+        """
+        context = _context(long_format=_long_format(product_density=846.2))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.recommended_id is None
+        for candidate in proposal.candidates:
+            assert "hard_constraint" in candidate["rejection_codes"], candidate["id"]
+            assert "плотность" in " ".join(candidate["rejection_reasons"]), candidate["id"]
+
+    def test_blending_lever_cannot_move_density_because_sulfur_caps_the_fraction(self):
+        """Граница реализации, зафиксированная числом, а не словами (ADR-016).
+
+        Доля дешёвого компонента ограничена балансом серы величиной порядка
+        1e-4, поэтому даже заметно более плотный компонент сдвигает плотность
+        смеси на сотые доли кг/м³ — ниже разрешения лабораторного значения.
+        Плотность ограничивает состояние продукта, но не является рычагом.
+        """
+        context = _context(long_format=_long_format(product_density=836.0, cut_density=860.0))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        values = [
+            item["recommendation"]["predicted_density_kg_m3"]
+            for item in proposal.candidates
+            if item["kind"] in ("blend", "no_action")
+        ]
+        assert values
+        assert max(values) - min(values) < 0.1
+
+    def test_unverified_cut_density_blocks_every_candidate(self):
+        """Неизмеренная плотность компонента — отказ, а не «возьмём плотность продукта»."""
+        context = _context(long_format=_long_format(cut_density=None))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        assert proposal.recommended_id is None
+        for candidate in proposal.candidates:
+            assert "density" in " ".join(candidate["rejection_reasons"]).lower() or (
+                "плотност" in " ".join(candidate["rejection_reasons"])
+            ), candidate["id"]
+
     def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
         """Порог действия берётся по худшему горизонту, на который оно влияет."""
         backtest = {
@@ -699,6 +750,31 @@ class TestOrchestrator:
         decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert any("не воспроизводится" in reason for reason in decision.rejection_reasons)
+
+    def test_claimed_density_must_survive_independent_recomputation(self, scenario_context):
+        """Плотность смеси пересчитывается оркестратором по аддитивности объёмов."""
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"] = submission["recommendation"] | {
+            "predicted_density_kg_m3": 830.0
+        }
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(item for item in decision.checks if item["check"] == "blend_density_recomputed")
+        assert check["passed"] is False
+
+    @pytest.mark.parametrize(
+        ("key", "value"), [("density_min_kg_m3", 700.0), ("density_max_kg_m3", 900.0)]
+    )
+    def test_density_range_cannot_be_widened_in_the_package(
+        self, scenario_context, key, value
+    ):
+        """Двусторонний диапазон нельзя расширить ни с одной стороны."""
+        submission, sources = _submission(scenario_context)
+        submission["applied_constraints"] = submission["applied_constraints"] | {key: value}
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        check = next(item for item in decision.checks if item["check"] == f"{key}_unchanged")
+        assert check["passed"] is False
 
     def test_agent_cannot_widen_its_own_ranges(self, scenario_context):
         submission, sources = _submission(scenario_context)

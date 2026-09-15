@@ -125,3 +125,12 @@ def test_unverified_indicator_is_named_in_the_risk_block():
     text = _card(_context(long_format=stale))
     assert "не подтверждён" in text
     assert "не сертифицируется" in text
+
+
+def test_density_is_shown_with_its_two_sided_range():
+    """Плотность — двусторонний диапазон, запас считается до ближайшей границы."""
+    text = _card(_context())
+    assert "| Плотность при 15 °C, кг/м³ |" in text
+    assert f"{config.DENSITY_MIN_KG_M3:g}–{config.DENSITY_MAX_KG_M3:g}" in text
+    assert "Прогноз плотности смеси" in text
+    assert "аддитивность объёмов" in text

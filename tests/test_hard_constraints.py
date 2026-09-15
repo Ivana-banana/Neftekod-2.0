@@ -63,6 +63,28 @@ class TestCetaneNumber:
         assert rules(constraints.check_cetane_number(value)) == {"cetane_number"}
 
 
+class TestDensity:
+    """Плотность — единственная проверка проекта с двусторонним диапазоном."""
+
+    @pytest.mark.parametrize("value", [820.0, 830.0, 845.0])
+    def test_inside_range_is_allowed(self, value):
+        assert constraints.check_density(value) == []
+
+    @pytest.mark.parametrize("value", [845.0001, 846.14, 856.2])
+    def test_above_maximum_is_violation(self, value):
+        """На реальных данных 12 анализов продукта из 1015 выше 845 кг/м³."""
+        assert rules(constraints.check_density(value)) == {"density"}
+
+    @pytest.mark.parametrize("value", [819.9999, 800.0, 0.0])
+    def test_below_minimum_is_violation(self, value):
+        """Слишком лёгкое топливо так же вне спецификации, как слишком тяжёлое."""
+        assert rules(constraints.check_density(value)) == {"density"}
+
+    @pytest.mark.parametrize("value", [None, float("nan"), "836", "", True])
+    def test_missing_or_non_numeric_is_violation(self, value):
+        assert rules(constraints.check_density(value)) == {"density"}
+
+
 class TestBlendFractions:
     def test_sum_of_one_is_allowed(self):
         assert constraints.check_blend_fractions({"a": 0.6, "b": 0.4}) == []
@@ -115,6 +137,7 @@ class TestValidateRecommendation:
             "predicted_sulfur_mg_kg": 8.2,
             "predicted_t95_c": 352.0,
             "predicted_cetane_number": 53.0,
+            "predicted_density_kg_m3": 836.0,
             "evidence_type": "simulated_unvalidated",
             "blend_fractions": {"godt": 0.85, "fraction_240_350": 0.15},
             "setpoints": {"T5": 352.0},
@@ -133,7 +156,9 @@ class TestValidateRecommendation:
         }
         assert rules(constraints.validate_recommendation(recommendation)) == {"sulfur"}
 
-    @pytest.mark.parametrize("key", ["predicted_t95_c", "predicted_cetane_number"])
+    @pytest.mark.parametrize(
+        "key", ["predicted_t95_c", "predicted_cetane_number", "predicted_density_kg_m3"]
+    )
     def test_missing_mandatory_indicator_rejects_recommendation(self, key):
         """Три обязательных показателя проверяются безусловно, а не «если поле есть».
 
@@ -160,6 +185,7 @@ class TestValidateRecommendation:
             "predicted_sulfur_mg_kg": 11.0,
             "predicted_t95_c": 372.0,
             "predicted_cetane_number": 44.0,
+            "predicted_density_kg_m3": 851.0,
             "blend_fractions": {"a": 0.5, "b": 0.4},
             "setpoints": {"T5": 500.0},
             "allowed_ranges": {"T5": (330.0, 370.0)},
@@ -168,6 +194,7 @@ class TestValidateRecommendation:
             "sulfur",
             "t95",
             "cetane_number",
+            "density",
             "evidence_type",
             "blend_fractions",
             "range",

@@ -90,6 +90,26 @@ def check_cetane_number(value) -> list[Violation]:
     return []
 
 
+def check_density(value_kg_m3) -> list[Violation]:
+    """Плотность товарного ДТ при 15 °C внутри диапазона ГОСТ (ADR-016).
+
+    Единственная проверка проекта с ограничением **с двух сторон**: и слишком
+    лёгкое, и слишком тяжёлое топливо не соответствует спецификации. Как и у
+    остальных обязательных показателей, отсутствующее значение — нарушение.
+    """
+    if not _is_number(value_kg_m3):
+        return [Violation("density", f"нет числового значения плотности: {value_kg_m3!r}")]
+    if value_kg_m3 < config.DENSITY_MIN_KG_M3 or value_kg_m3 > config.DENSITY_MAX_KG_M3:
+        return [
+            Violation(
+                "density",
+                f"плотность {value_kg_m3} кг/м³ вне диапазона "
+                f"{config.DENSITY_MIN_KG_M3}–{config.DENSITY_MAX_KG_M3} кг/м³",
+            )
+        ]
+    return []
+
+
 def check_blend_fractions(fractions) -> list[Violation]:
     """Доли компонентов блендинга суммируются в 100% и неотрицательны."""
     if not fractions:
@@ -150,11 +170,13 @@ def validate_recommendation(recommendation: dict) -> list[Violation]:
     """
     violations: list[Violation] = []
     violations += check_sulfur(recommendation.get("predicted_sulfur_mg_kg"))
-    # Три обязательных показателя проверяются безусловно, а не «если поле есть»:
-    # организаторы назвали обязательными серу, T95 и цетановое число (ADR-004),
-    # и рекомендация без одного из них не является проверенной рекомендацией.
+    # Показатели спецификации проверяются безусловно, а не «если поле есть»:
+    # серу, T95 и цетановое число назвали обязательными организаторы (ADR-004),
+    # плотность добавлена как нормируемый ГОСТ показатель, измеряемый на той же
+    # точке (ADR-016). Рекомендация без любого из них не является проверенной.
     violations += check_t95(recommendation.get("predicted_t95_c"))
     violations += check_cetane_number(recommendation.get("predicted_cetane_number"))
+    violations += check_density(recommendation.get("predicted_density_kg_m3"))
     violations += check_evidence_type(recommendation.get("evidence_type"))
     if "blend_fractions" in recommendation:
         violations += check_blend_fractions(recommendation["blend_fractions"])

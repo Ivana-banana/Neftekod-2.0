@@ -37,6 +37,7 @@ RECOMMENDATION_KEYS = frozenset(
         "predicted_sulfur_mg_kg",
         "predicted_t95_c",
         "predicted_cetane_number",
+        "predicted_density_kg_m3",
         "evidence_type",
         "blend_fractions",
         "setpoints",
@@ -48,6 +49,8 @@ APPLIED_CONSTRAINT_KEYS = frozenset(
         "sulfur_limit_mg_kg",
         "t95_limit_c",
         "cetane_number_min",
+        "density_min_kg_m3",
+        "density_max_kg_m3",
         "blend_fraction_sum",
         "allowed_ranges",
         "allowed_ranges_basis",
@@ -71,10 +74,11 @@ REVIEW_LIMITS = (
     "данными, потому что данных по рецептурам в пакете нет.",
     "Проверка подтверждает допустимость режима по заявленным ограничениям, "
     "а не безопасность режима в цехе.",
-    "T95 и цетановое число смеси пересчитываются по моделям смешения "
-    "(массовый баланс и blend index, ADR-015), а сами модели историей не "
-    "проверялись: воспроизводимо — арифметика, а не физика смешения. "
-    "Цетановое число дешёвого компонента вообще не измеряется (допущение).",
+    "T95, цетановое число и плотность смеси пересчитываются по моделям "
+    "смешения (массовый баланс, blend index и аддитивность объёмов — "
+    "ADR-015, ADR-016), а сами модели историей не проверялись: воспроизводимо "
+    "— арифметика, а не физика смешения. Цетановое число дешёвого компонента "
+    "вообще не измеряется (допущение).",
 )
 
 
@@ -406,6 +410,8 @@ def review(submission: dict, *, sources: dict) -> Decision:
     for key, project_value, title in (
         ("t95_limit_c", config.T95_LIMIT_C, "предел T95"),
         ("cetane_number_min", config.CETANE_NUMBER_MIN, "минимум цетанового числа"),
+        ("density_min_kg_m3", config.DENSITY_MIN_KG_M3, "нижняя граница плотности"),
+        ("density_max_kg_m3", config.DENSITY_MAX_KG_M3, "верхняя граница плотности"),
     ):
         applied_value = applied.get(key, project_value)
         if applied_value != project_value:
@@ -464,6 +470,17 @@ def review(submission: dict, *, sources: dict) -> Decision:
             checks,
             reasons,
             "ед. ЦЧ",
+        )
+        _verify_blended(
+            "blend_density_recomputed",
+            recommendation.get("predicted_density_kg_m3"),
+            components,
+            fractions,
+            "density_kg_m3",
+            spec.blend_density,
+            checks,
+            reasons,
+            "кг/м³",
         )
 
     allowed = applied.get("allowed_ranges") or {}
@@ -583,8 +600,8 @@ def review(submission: dict, *, sources: dict) -> Decision:
         explanation=(
             f"Рекомендация «{action}» утверждена: жёсткие проверки выполнены оркестратором "
             "заново на числах рекомендации, ограничения сверены с независимыми выводами "
-            "агентов качества и надёжности, все три обязательных показателя смеси — сера, "
-            "T95 и цетановое число — пересчитаны по входу своими моделями смешения, "
+            "агентов качества и надёжности, показатели смеси — сера, T95, цетановое "
+            "число и плотность — пересчитаны по входу своими моделями смешения, "
             "статус-кво определён по фактическим уставкам, а не по ярлыку. "
             f"Тип обоснования: {recommendation.get('evidence_type')}."
         ),

@@ -1,21 +1,25 @@
-"""Показатели спецификации товарного ДТ помимо серы: T95 и цетановое число.
+"""Показатели спецификации товарного ДТ помимо серы: T95, цетановое число, плотность.
 
 Организаторы назвали обязательными три показателя — серу, T95 и цетановое
 число (`docs/tz/organizer-clarifications.md`, ADR-004). Сера была реализована
 первой, потому что её предел задан организаторами; численные пределы двух
 остальных они прямо оставили на усмотрение команды, и это единственная
 причина, по которой они появились позже, а не признак их второстепенности.
+Плотность при 15 °C добавлена следом (ADR-016): организаторы её отдельно не
+называли, но это нормируемый ГОСТ показатель, измеряемый на той же точке, и
+на реальных данных он нарушается — 12 анализов продукта из 1015 выше 845 кг/м³.
 
 Модуль отвечает за два разных вопроса и намеренно их не смешивает:
 
-1. **Что измерено.** Оба показателя есть в ЛИМС на той же точке отбора
-   «Гидроочистка.2», что и сера товарного продукта: `95%.T` — суточно,
+1. **Что измерено.** Все три показателя есть в ЛИМС на той же точке отбора
+   «Гидроочистка.2», что и сера товарного продукта: `95%.T` и `D15` — суточно,
    `CetaneNumber` — примерно раз в месяц. Блокировка ADR-003 касается
    ссылки `Pipeline` внутри формулы ВАК, а не прямых лабораторных измерений,
    поэтому здесь используются измерения, а не расчёт по формуле.
 2. **Что домыслено.** Цетановое число дешёвого компонента в пакете не
-   измеряется вовсе — это явное допущение сценария (см. `CUT_CETANE_NUMBER`).
-   Модели смешения тоже допущения: историей они не проверялись.
+   измеряется вовсе — это явное допущение сценария (см. `CUT_CETANE_NUMBER`);
+   T95 и плотность того же компонента измеряются. Модели смешения — тоже
+   допущения: историей они не проверялись.
 
 Возраст значения важнее его наличия: `features.synchronize_features()` по
 построению отдаёт последнее измерение любой давности (ADR-009), поэтому у
@@ -35,9 +39,11 @@ from . import config, splits
 # Точка отбора та же, что у серы товарного продукта (features.TARGET_TAG).
 BASE_T95_TAG = "LIMS:Гидроочистка.2.95%.T"
 BASE_CETANE_TAG = "LIMS:Гидроочистка.2.CetaneNumber"
+BASE_DENSITY_TAG = "LIMS:Гидроочистка.2.D15"
 # Дешёвый компонент блендинга — сырьё гидроочистки, та же точка, из которой
 # берётся его сера в ADR-013.
 CUT_T95_TAG = "LIMS:Гидроочистка.1.95%.T"
+CUT_DENSITY_TAG = "LIMS:Гидроочистка.1.D15"
 
 # Цетановое число дешёвого компонента не измеряется ни в одной точке пакета.
 # Взята нижняя граница ориентира для straight-run diesel из
@@ -62,6 +68,11 @@ CETANE_BLEND_INDEX_EXPONENT = 1.5
 # минимум по всей выгрузке равен 0 °C. Такое значение не является измерением
 # и не используется, иначе смесь получает несуществующий запас по T95.
 MIN_PHYSICAL_T95_C = 100.0
+
+# Плотность жидкого нефтепродукта не бывает ниже этого порядка; ноль или
+# околонулевое значение — дефект выгрузки, а не лёгкое топливо. Порог взят с
+# большим запасом от реального минимума выгрузки (797.5 кг/м³ у компонента).
+MIN_PHYSICAL_DENSITY_KG_M3 = 500.0
 
 
 @dataclass(frozen=True)
@@ -238,21 +249,41 @@ def blend_cetane_number(fractions: dict, component_cetane: dict) -> float | None
     return min(index, linear)
 
 
+def blend_density(fractions: dict, component_density: dict) -> float | None:
+    """Плотность смеси по аддитивности объёмов: 1/ρ = Σ wᵢ/ρᵢ (ADR-004).
+
+    Массовые доли делятся на плотности компонентов, то есть складываются
+    удельные объёмы — это рекомендованная внешним ориентиром форма, а не
+    линейное усреднение плотностей. Небольшим сжатием объёма при смешении
+    источник прямо разрешает пренебречь.
+    """
+    total = 0.0
+    for name, weight in (fractions or {}).items():
+        value = component_density.get(name)
+        if value is None or float(value) <= 0.0:
+            return None
+        total += float(weight) / float(value)
+    if total <= 0.0:
+        return None
+    return 1.0 / total
+
+
 @dataclass(frozen=True)
 class SpecIndicators:
     """Обязательные показатели продукта, кроме серы, на момент выдачи."""
 
     t95: Measured
     cetane_number: Measured
+    density: Measured
 
     @property
     def verified(self) -> bool:
-        return self.t95.verified and self.cetane_number.verified
+        return self.t95.verified and self.cetane_number.verified and self.density.verified
 
     def unverified_reasons(self) -> list[str]:
         return [
             item.detail
-            for item in (self.t95, self.cetane_number)
+            for item in (self.t95, self.cetane_number, self.density)
             if not item.verified
         ]
 
@@ -274,6 +305,22 @@ class SpecIndicators:
                     None
                     if self.cetane_number.value is None
                     else self.cetane_number.value - config.CETANE_NUMBER_MIN
+                ),
+            },
+            "density": self.density.to_dict()
+            | {
+                "minimum_kg_m3": config.DENSITY_MIN_KG_M3,
+                "maximum_kg_m3": config.DENSITY_MAX_KG_M3,
+                "direction": "range",
+                # У двустороннего диапазона запас — расстояние до ближайшей
+                # границы: запас до верхней границы ничего не говорит о нижней.
+                "margin_kg_m3": (
+                    None
+                    if self.density.value is None
+                    else min(
+                        config.DENSITY_MAX_KG_M3 - self.density.value,
+                        self.density.value - config.DENSITY_MIN_KG_M3,
+                    )
                 ),
             },
             "limits_basis": (
@@ -300,6 +347,13 @@ def resolve_product_indicators(long_format: pd.DataFrame, issue_time) -> SpecInd
             BASE_CETANE_TAG,
             max_age_hours=config.CETANE_MAX_AGE_HOURS,
         ),
+        density=resolve_measured(
+            long_format,
+            issue_time,
+            BASE_DENSITY_TAG,
+            max_age_hours=config.DENSITY_MAX_AGE_HOURS,
+            min_physical=MIN_PHYSICAL_DENSITY_KG_M3,
+        ),
     )
 
 
@@ -311,4 +365,20 @@ def resolve_cut_t95(long_format: pd.DataFrame, issue_time) -> Measured:
         CUT_T95_TAG,
         max_age_hours=config.T95_MAX_AGE_HOURS,
         min_physical=MIN_PHYSICAL_T95_C,
+    )
+
+
+def resolve_cut_density(long_format: pd.DataFrame, issue_time) -> Measured:
+    """Измеренная плотность дешёвого компонента блендинга на момент выдачи.
+
+    Отбирается заметно реже продукта (p90 интервала на train — 79.3 суток),
+    поэтому порог устаревания свой, по тому же правилу p90, что и у остальных
+    показателей. См. ADR-016.
+    """
+    return resolve_measured(
+        long_format,
+        issue_time,
+        CUT_DENSITY_TAG,
+        max_age_hours=config.CUT_DENSITY_MAX_AGE_HOURS,
+        min_physical=MIN_PHYSICAL_DENSITY_KG_M3,
     )
