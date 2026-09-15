@@ -60,7 +60,7 @@ def _at_resolution(value: float, step: float) -> float:
 
 def _unverified(rule: str, title: str) -> list[Violation]:
     return [
-        Violation(rule, f"{title} не подтверждён анализом: числа нет", kind=UNVERIFIED)
+        Violation(rule, f"показатель «{title}» не подтверждён анализом: числа нет", kind=UNVERIFIED)
     ]
 
 

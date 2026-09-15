@@ -477,15 +477,26 @@ def review(submission: dict, *, sources: dict) -> Decision:
             f"пересчитанной оркестратором {unverified}"
         )
     indicators = (sources.get("quality") or {}).get("spec_indicators") or {}
+    field_of = {indicator: field for field, indicator in SPEC_COMPONENT_KEYS.items()}
     for violation in violations:
         if violation.kind != constraints.UNVERIFIED or not is_status_quo:
             continue
         measured = indicators.get(violation.rule) or {}
-        detail = (
-            measured.get("detail")
-            if measured and not measured.get("verified")
-            else f"показатель смеси не подтверждён: {violation.detail}"
-        )
+        if measured and not measured.get("verified"):
+            detail = measured.get("detail")
+        else:
+            # Продукт измерен, значит не хватает значения у другого компонента
+            # смеси — назвать его, чтобы оператор не проверял свежий анализ.
+            components = scenario_input.get("components") or {}
+            missing = [
+                name
+                for name in recommendation.get("blend_fractions") or {}
+                if (components.get(name) or {}).get(field_of.get(violation.rule)) is None
+            ]
+            detail = (
+                f"значение смеси не определено — нет подтверждённого значения у "
+                f"компонента {', '.join(missing) or 'неизвестно какого'}"
+            )
         warnings.append(
             f"обязательный показатель «{SPEC_TITLES.get(violation.rule, violation.rule)}» "
             f"не подтверждён: {detail}. Режим сохраняется, но соответствие по этому "

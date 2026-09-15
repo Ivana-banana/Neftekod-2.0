@@ -692,6 +692,19 @@ class TestOrchestratorUnverified:
         assert any("цетанов" in warning for warning in decision.warnings)
         assert all(check["passed"] for check in decision.checks), decision.checks
 
+    def test_unverified_cut_component_is_named_in_the_warning(self):
+        """Сценарий 4: плотность продукта измерена, а у дешёвого компонента — нет.
+
+        Предупреждение обязано назвать, чьего значения не хватает: иначе оператор
+        пойдёт проверять анализ продукта, который как раз свежий.
+        """
+        submission, sources = _submission(_context(long_format=_long_format(cut_density=None)))
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "approved", decision.rejection_reasons
+        [warning] = [item for item in decision.warnings if "плотность" in item]
+        assert "straight_run_240_350" in warning
+        assert "hydrotreated_diesel" not in warning
+
     def test_change_with_unverified_indicator_is_rejected(self):
         context = _stale_cetane_context()
         quality_assessment = quality.assess(context)
