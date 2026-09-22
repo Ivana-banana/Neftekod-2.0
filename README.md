@@ -49,9 +49,9 @@ python scripts/run_all_scenarios.py   # 4 сценария → build/scenario_*/
 pytest -q                             # 336 passed
 ```
 
-Без телеметрии работают `prepare_data.py` и `pytest` (часть тестов
-пропускается); `evaluate_forecast.py` и `run_all_scenarios.py` завершаются с
-кодом 1 и называют недостающий файл.
+Без телеметрии работают `prepare_data.py` и `pytest` (324 passed, 12 skipped);
+`evaluate_forecast.py` и `run_all_scenarios.py` завершаются с кодом 1 и
+называют недостающий файл.
 
 Скрипты не зависят от текущего каталога (пути от `Path(__file__)`); `build/`
 создаётся автоматически. Случайности в прогоне нет: два запуска подряд дают
@@ -215,6 +215,6 @@ CI (`.github/workflows/tests.yml`) прогоняет то же на Python 3.12
 | `build/` | результаты (в git не хранится) |
 
 Зависимости — `pyproject.toml`: pandas ≥ 2.2, numpy ≥ 1.26, openpyxl, tabulate;
-dev — pytest. Проверено с pandas 3.0.6 / numpy 2.5.3 (Python 3.12, 3.14); при
-pandas 2.2 результат тот же, кроме последнего знака float в двух текстовых
-полях.
+dev — pytest. Проверено 2026-09-22 на чистом клоне: Python 3.12 и 3.14 с
+pandas 3.0.6 / numpy 2.5.3 и Python 3.12 с pandas 2.2.3 / numpy 1.26.4 —
+все 28 файлов `build/scenario_*/` побайтово одинаковы, 336 passed.
