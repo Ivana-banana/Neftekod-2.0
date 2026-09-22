@@ -36,6 +36,12 @@ MAX_SIGNAL_AGE_HOURS = 1.0
 # ограничений скорости изменения в задаче не задано (ответы организаторов),
 # и придумывать за них предел нельзя. См. ADR-010.
 FAST_EXCURSION_BANDS_PER_HOUR = 1.0
+# Останов установки: T11 (массовый расход сырья по справочнику КИП) ниже 50
+# при обычных ~360 — 7073 строки train, названные простоем в ADR-018. Единицы
+# сигнала не подтверждены (ADR-007), поэтому это признак «сырьё не идёт», а не
+# число в т/ч. Такой момент — не «тяжёлый режим», а отсутствие режима, и
+# оператору это говорится прямо (ADR-019).
+SHUTDOWN_T11_MAX = 50.0
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class ReliabilityAssessment:
     assumptions: list
     refusal: dict | None = None
     telemetry_defects: dict = field(default_factory=dict)
+    plant_stopped: bool = False
     agent: str = field(default="reliability", init=False)
 
     def to_dict(self) -> dict:
@@ -61,6 +68,7 @@ class ReliabilityAssessment:
             "severity_index": self.severity_index,
             "severity_class": self.severity_class,
             "regime_admissible": self.regime_admissible,
+            "plant_stopped": self.plant_stopped,
             "risk_factors": self.risk_factors,
             "signals": self.signals,
             "allowed_ranges": self.allowed_ranges,
@@ -116,6 +124,9 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
         "Значение ровно 307.0 и сигнал, повторивший одно число 6 строк подряд, "
         "считаются дефектом датчика и не используются как измерение (ADR-018). "
         "Отрицательные значения дефектом не считаются: они совпадают с простоем.",
+        f"T11 ниже {SHUTDOWN_T11_MAX:g} при обычных ~360 трактуется как останов "
+        "установки (простой по ADR-018): тогда индекс тяжести описывает не "
+        "режим, а его отсутствие, и любое изменение уставок недопустимо (ADR-019).",
     ]
     unusable = []
     for tag in features.TELEMETRY_TAGS:
@@ -206,11 +217,20 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
             )
 
     severity = min(1.0, max(excursions) + max(instabilities))
+    plant_stopped = bool(context.snapshot["T11_value"] < SHUTDOWN_T11_MAX)
+    if plant_stopped:
+        risk_factors.insert(
+            0,
+            f"установка остановлена: T11 = {context.snapshot['T11_value']:.4g} при пороге "
+            f"останова {SHUTDOWN_T11_MAX:g} (обычно ~360, ADR-018) — сырьё не идёт, "
+            "режима нет; рекомендации по режиму невозможны",
+        )
     return ReliabilityAssessment(
         issue_time=str(context.issue_time),
         severity_index=severity,
         severity_class=_severity_class(severity),
-        regime_admissible=severity < ADMISSIBLE_SEVERITY_MAX,
+        regime_admissible=severity < ADMISSIBLE_SEVERITY_MAX and not plant_stopped,
+        plant_stopped=plant_stopped,
         signals=signals,
         risk_factors=risk_factors,
         allowed_ranges=allowed_ranges,

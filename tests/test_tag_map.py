@@ -3,7 +3,7 @@
 import pandas as pd
 import pytest
 
-from neftekod import config, parse_lims_pak, tag_map
+from neftekod import config, tag_map
 
 
 def test_no_record_lost_from_source_sheets():
@@ -29,11 +29,11 @@ def test_kip_codes_are_qualified_by_installation():
     assert "24-2000:T6" in set(kip["code"])
 
 
-def test_tags_without_unit_are_flagged_not_dropped():
+def test_tags_without_unit_are_flagged_not_dropped(pak_long):
     """Тег без подтверждённой единицы остаётся в карте с пустым `unit`."""
-    frame = tag_map.attach_units_from_exports(
-        tag_map.build_tag_map(), parse_lims_pak.parse_pak()
-    )
+    # pak_long — сессионная фикстура conftest: тот же parse_pak(), но без
+    # второго разбора 6.7 МБ xlsx (~2.7 с) только для этого теста.
+    frame = tag_map.attach_units_from_exports(tag_map.build_tag_map(), pak_long)
     without_unit = tag_map.tags_without_unit(frame)
     # Единицы в пакете объявлены только в самих выгрузках ЛИМС/ПАК; из
     # справочника единицу получает только `24-2000:D15` (у тега серы имя в
@@ -76,11 +76,24 @@ def test_duplicate_description_pairs_disagree_in_telemetry():
     for path in (config.HT_TELEMETRY_CSV, config.AVT_TELEMETRY_CSV):
         if not path.exists():
             pytest.skip(f"нет {path} — скачать по ссылке из README")
-    telemetry = {
-        "24-2000": pd.read_csv(config.HT_TELEMETRY_CSV),
-        "АВТ": pd.read_csv(config.AVT_TELEMETRY_CSV),
-    }
     duplicates = tag_map.duplicate_descriptions(tag_map.build_tag_map())
+    # Читаются только пары-дубликаты: полный avt_tags.csv (236 МБ, 74 колонки)
+    # ради нескольких колонок — лишние ~1 с и ~150 МБ RSS в тестах.
+    needed = {
+        installation: sorted(
+            {
+                code
+                for row in duplicates.itertuples()
+                if row.installation == installation
+                for code in row.codes
+            }
+        )
+        for installation in ("24-2000", "АВТ")
+    }
+    telemetry = {
+        "24-2000": pd.read_csv(config.HT_TELEMETRY_CSV, usecols=needed["24-2000"]),
+        "АВТ": pd.read_csv(config.AVT_TELEMETRY_CSV, usecols=needed["АВТ"]),
+    }
     correlations = {}
     for row in duplicates.itertuples():
         frame = telemetry[row.installation]

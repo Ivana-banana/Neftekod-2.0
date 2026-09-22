@@ -28,18 +28,29 @@ class _IndexedSeries:
     available_ns: np.ndarray | None
     value_column: str
 
+    def __post_init__(self) -> None:
+        # Колонки один раз берутся как массивы: frame.iloc[position] на каждый
+        # момент выдачи стоил ~75 мкс и давал 90 % времени backtest.
+        # DatetimeArray[i] упаковывает в тот же pd.Timestamp, что и строка iloc.
+        object.__setattr__(self, "_values", self.frame[self.value_column].to_numpy(dtype=float))
+        object.__setattr__(self, "_timestamps", self.frame["timestamp"].array)
+        object.__setattr__(
+            self,
+            "_available",
+            None if self.available_ns is None else self.frame["available_at"].array,
+        )
+
     def latest(self, as_of: pd.Timestamp) -> tuple[float, pd.Timestamp, pd.Timestamp | None] | None:
         """Вернуть последнее конечное наблюдение, допустимое на as_of."""
         if self.frame.empty:
             return None
         position = int(np.searchsorted(self.timestamp_ns, as_of.value, side="right") - 1)
         while position >= 0:
-            row = self.frame.iloc[position]
             if self.available_ns is None or self.available_ns[position] <= as_of.value:
                 return (
-                    float(row[self.value_column]),
-                    row["timestamp"],
-                    None if self.available_ns is None else row["available_at"],
+                    float(self._values[position]),
+                    self._timestamps[position],
+                    None if self.available_ns is None else self._available[position],
                 )
             position -= 1
         return None

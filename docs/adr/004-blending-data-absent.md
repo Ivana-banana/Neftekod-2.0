@@ -30,7 +30,7 @@
 действует и для модельных данных наравне с реальными — не смягчается из-за
 отсутствия официальной спецификации.
 
-## Внешний ориентир — deep research (research_brief_manus.md §1, §3)
+## Внешний ориентир — deep research (docs/internal/research_brief_manus.md §1, §3)
 
 Источники: `docs/research/2026-09-dt-spec-gost-en590.md` (спецификация ДТ),
 `docs/research/2026-09-blending-recipes.md` (типовая логика блендинга).

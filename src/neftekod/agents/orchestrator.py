@@ -61,8 +61,13 @@ APPLIED_CONSTRAINT_KEYS = frozenset(
         "regime_admissible",
     }
 )
-SOURCE_KEYS = ("quality", "reliability", "snapshot")
-BLOCKING_QUALITY_RISKS = frozenset({"high", "spec_violation_predicted"})
+# Независимые источники: выводы ролей, снимок входа, показатели компонентов
+# смеси, разрешённые из данных без участия агента оптимизации, и модельный
+# текущий состав из постановки блендинга (ADR-019: до этого показатели
+# дешёвого компонента и «текущие доли» брались из самого пакета).
+SOURCE_KEYS = ("quality", "reliability", "snapshot", "components", "current_blend_fractions")
+BLOCKING_QUALITY_RISKS = frozenset({"high", "spec_violation_predicted", "spec_violation_measured"})
+COMPONENT_FIELDS = ("sulfur_mg_kg", "t95_c", "cetane_number", "density_kg_m3")
 SETPOINT_TOLERANCE = 1e-9
 # Показатель спецификации: поле компонента во входе → ключ вывода агента качества.
 SPEC_COMPONENT_KEYS = {"t95_c": "t95", "cetane_number": "cetane_number", "density_kg_m3": "density"}
@@ -85,9 +90,13 @@ REVIEW_LIMITS = (
     "вообще не измеряется (допущение).",
     "Сохранение режима при неподтверждённом показателе утверждается с пометкой "
     "(ADR-017). Показатели базового компонента сверяются с агентом качества, "
-    "поэтому выдать измеренное нарушение за «нет анализа» нельзя; T95 и "
-    "плотность дешёвого компонента независимого источника у оркестратора не "
-    "имеют и берутся из входа.",
+    "показатели дешёвого компонента и текущий состав — с источниками, "
+    "разрешёнными из данных и постановки блендинга без участия агента "
+    "оптимизации (ADR-019); сами анализы компонента оркестратор не перепроверяет.",
+    "Текущая уставка вне модельного диапазона p05–p95 у статус-кво даёт "
+    "предупреждение, а не отказ: диапазон — допущение для эксперимента, а не "
+    "промышленный предел (ТЗ, §4); допустимость режима оценивает агент "
+    "надёжности (ADR-019).",
 )
 
 
@@ -166,7 +175,11 @@ def _recompute_blend_sulfur(components: dict, fractions: dict) -> tuple[float | 
 def _component_values(components: dict, fractions: dict, key: str) -> tuple[dict | None, str]:
     """Значения показателя по компонентам входа; None, если хоть одно неизвестно."""
     values = {}
-    for name in fractions or {}:
+    # Компонент с нулевой долей в смеси отсутствует — его анализ не нужен,
+    # как и в `spec._contributing` (ADR-019).
+    for name, weight in (fractions or {}).items():
+        if _close(weight, 0.0, 1e-15):
+            continue
         item = components.get(name) or {}
         value = item.get(key)
         if not isinstance(value, (int, float)) or isinstance(value, bool) or math.isnan(value):
@@ -372,6 +385,82 @@ def _cross_check_with_roles(
                 "измерениями агента качества — нарушение нельзя выдать за «нет анализа»"
             )
 
+    # Показатели дешёвого компонента и текущий состав — против источников,
+    # собранных без агента оптимизации (ADR-019): иначе занизить серу
+    # компонента или объявить новую долю «текущей» можно было бы в самом пакете.
+    independent = sources.get("components") or {}
+    components = scenario_input.get("components") or {}
+    mismatched = []
+    for name, expected in independent.items():
+        declared = components.get(name) or {}
+        for field in COMPONENT_FIELDS:
+            if field not in expected:
+                continue
+            left, right = declared.get(field), expected.get(field)
+            if not ((left is None and right is None) or _close(left, right, 1e-9)):
+                mismatched.append(f"{name}.{field}: в пакете {left!r}, независимо {right!r}")
+    checks.append(
+        _check(
+            "component_values_match_sources",
+            not mismatched,
+            "показатели компонентов смеси сверены с независимо разрешёнными анализами: "
+            + ("; ".join(mismatched) if mismatched else f"совпадают для {sorted(independent)}"),
+        )
+    )
+    if mismatched:
+        reasons.append(
+            "показатели компонентов смеси во входе не совпадают с независимыми источниками: "
+            + "; ".join(mismatched)
+        )
+    fractions_match = _same_mapping(
+        scenario_input.get("current_blend_fractions"), sources.get("current_blend_fractions"), 1e-12
+    )
+    checks.append(
+        _check(
+            "current_blend_fractions_match_sources",
+            fractions_match,
+            "текущий состав во входе сверен с постановкой блендинга, а не с копией в пакете",
+        )
+    )
+    if not fractions_match:
+        reasons.append(
+            "текущий состав во входе не совпадает с постановкой блендинга: объявить новую "
+            "долю «текущей» и выдать изменение за статус-кво нельзя"
+        )
+
+    issue_matches = str(scenario_input.get("issue_time")) == str(quality.get("issue_time"))
+    checks.append(
+        _check(
+            "issue_time_matches_quality",
+            issue_matches,
+            f"в пакете {scenario_input.get('issue_time')!r}, у агента качества {quality.get('issue_time')!r}",
+        )
+    )
+    if not issue_matches:
+        reasons.append("момент выдачи в пакете не совпадает с моментом выдачи агента качества")
+    nonphysical = [
+        name
+        for name, item in components.items()
+        if isinstance(item, dict)
+        and item.get("sulfur_mg_kg") is not None
+        and not (
+            isinstance(item.get("sulfur_mg_kg"), (int, float))
+            and not isinstance(item.get("sulfur_mg_kg"), bool)
+            and math.isfinite(item["sulfur_mg_kg"])
+            and item["sulfur_mg_kg"] >= 0.0
+        )
+    ]
+    checks.append(
+        _check(
+            "component_sulfur_physical",
+            not nonphysical,
+            "сера каждого компонента входа — конечное неотрицательное число"
+            + (f"; нарушают: {nonphysical}" if nonphysical else ""),
+        )
+    )
+    if nonphysical:
+        reasons.append(f"нефизичная сера у компонентов входа: {nonphysical}")
+
     current = {
         key: snapshot.get(f"{key}_value") for key in (scenario_input.get("current_setpoints") or {})
     }
@@ -458,6 +547,36 @@ def review(submission: dict, *, sources: dict) -> Decision:
             )
         else:
             reasons.append(f"жёсткое ограничение {violation.rule}: {violation.detail}")
+    # Текущая уставка вне модельного диапазона у статус-кво — предупреждение
+    # оператору, а не отказ (ADR-019); у изменения она уже в blocking выше.
+    for detail in constraints.out_of_model_range(violations) if is_status_quo else []:
+        warnings.append(
+            f"текущая уставка вне модельного диапазона p05–p95 обучающей выборки: {detail}. "
+            "Режим сохраняется; диапазон — допущение для эксперимента, а не промышленный "
+            "предел, допустимость режима оценивает агент надёжности (ADR-019)"
+        )
+
+    # Доказанное нарушение по измеренному показателю продукта пересчитывается
+    # оркестратором по выводу агента качества, а не берётся из пакета: анализ
+    # 10.5 мг/кг блокирует всё, включая сохранение режима (ADR-019).
+    quality_source = sources.get("quality") or {}
+    measured_indicators = quality_source.get("spec_indicators") or {}
+    measured = constraints.check_measured_product(
+        measured_indicators, (measured_indicators.get("sulfur") or {}).get("value")
+    )
+    checks.append(
+        _check(
+            "measured_product_within_spec",
+            not measured,
+            "измеренные сера, T95, ЦЧ и плотность продукта из вывода агента качества "
+            "сравнены с пределами; доказанных нарушений: " + str(len(measured)),
+        )
+    )
+    for violation in measured:
+        reasons.append(
+            f"доказанное нарушение спецификации {violation.rule}: {violation.detail} — "
+            "блокирует и сохранение режима (ADR-019)"
+        )
 
     # Пометку оркестратор выводит сам и сверяет с пакетом: снять её, чтобы
     # hold выглядел полностью подтверждённым, нельзя.
@@ -611,13 +730,15 @@ def review(submission: dict, *, sources: dict) -> Decision:
     checks.append(
         _check(
             "setpoints_within_applied_ranges",
-            not range_violations,
+            not range_violations or is_status_quo,
             "уставки проверены против allowed_ranges из применённых ограничений; "
-            "нарушений: " + str(len(range_violations)),
+            "вне диапазона: " + str(len(range_violations))
+            + (" (статус-кво — предупреждение, ADR-019)" if range_violations and is_status_quo else ""),
         )
     )
-    for violation in range_violations:
-        reasons.append(f"уставка вне применённого диапазона: {violation.detail}")
+    if not is_status_quo:
+        for violation in range_violations:
+            reasons.append(f"уставка вне применённого диапазона: {violation.detail}")
 
     action = recommendation.get("action")
     if action == "hold" and not is_status_quo:
@@ -637,6 +758,30 @@ def review(submission: dict, *, sources: dict) -> Decision:
             _check("hold_really_holds", True, "уставки и состав совпадают с текущими")
         )
 
+    # Честность подписи: backtested имеет право нести только статус-кво с
+    # чистым (без модельной доли) составом — прогноз и есть весь вывод.
+    # Любое изменение — simulated_unvalidated по построению (ADR-019).
+    evidence = recommendation.get("evidence_type")
+    independent_fractions = sources.get("current_blend_fractions") or {}
+    pure_status_quo = is_status_quo and all(
+        _close(weight, 0.0, 1e-15) or _close(weight, 1.0, 1e-15)
+        for weight in independent_fractions.values()
+    )
+    evidence_honest = evidence != "backtested" or pure_status_quo
+    checks.append(
+        _check(
+            "evidence_type_honest",
+            evidence_honest,
+            f"evidence_type {evidence!r}; статус-кво: {is_status_quo}, "
+            f"состав без модельной доли: {pure_status_quo}",
+        )
+    )
+    if not evidence_honest:
+        reasons.append(
+            "подпись backtested заявлена для изменения режима/состава или для "
+            "модельного состава — это оценка эффекта, а не проверенный историей прогноз"
+        )
+
     risk = applied.get("quality_risk_exceed_spec")
     rmse = applied.get("forecast_backtest_rmse_mg_kg")
     if risk in BLOCKING_QUALITY_RISKS:
@@ -646,7 +791,7 @@ def review(submission: dict, *, sources: dict) -> Decision:
         warnings.append(
             f"агент качества оценил риск нарушения спецификации как {risk}: запас по сере "
             f"меньше backtest-RMSE прогноза ({rmse!r} мг/кг на худшем горизонте). "
-            "Режим сохраняется, но контроль серы ослаблять нельзя"
+            "Контроль серы ослаблять нельзя; следующий анализ ЛИМС обязателен"
         )
     if not is_status_quo:
         margin = (
@@ -654,20 +799,37 @@ def review(submission: dict, *, sources: dict) -> Decision:
             if isinstance(claimed, (int, float)) and not isinstance(claimed, bool)
             else None
         )
+        # Запас статус-кво оркестратор считает сам — по независимому текущему
+        # составу и компонентам входа, уже сверенным выше (ADR-019).
+        status_quo_sulfur, _ = _recompute_blend_sulfur(
+            submission["input"].get("components", {}),
+            sources.get("current_blend_fractions") or {},
+        )
+        status_quo_margin = None if status_quo_sulfur is None else limit - status_quo_sulfur
         covered = margin is not None and isinstance(rmse, (int, float)) and margin >= rmse
+        # Действие, не уменьшающее запас по сере относительно статус-кво, не
+        # рискованнее сохранения режима — тот же принцип, что у агента
+        # оптимизации (ADR-019).
+        not_worse = (
+            margin is not None
+            and status_quo_margin is not None
+            and margin >= status_quo_margin - 1e-12
+        )
         if risk in BLOCKING_QUALITY_RISKS:
             checks.append(
                 _check(
                     "action_allowed_under_quality_risk",
-                    covered,
-                    f"риск качества {risk}; запас {margin!r} против backtest-RMSE {rmse!r}",
+                    covered or not_worse,
+                    f"риск качества {risk}; запас {margin!r} против backtest-RMSE {rmse!r}, "
+                    f"запас статус-кво {status_quo_margin!r}",
                 )
             )
-            if not covered:
+            if not (covered or not_worse):
                 reasons.append(
                     f"агент качества оценил риск нарушения спецификации как {risk}, "
                     f"а действие не оставляет запаса больше ошибки прогноза "
-                    f"({margin!r} против {rmse!r}) — конфликт целей решён в пользу качества"
+                    f"({margin!r} против {rmse!r}) и уменьшает запас относительно "
+                    f"статус-кво ({status_quo_margin!r}) — конфликт целей решён в пользу качества"
                 )
         if applied.get("regime_admissible") is False:
             checks.append(

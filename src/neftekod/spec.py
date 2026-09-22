@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import pandas as pd
@@ -148,14 +149,15 @@ def resolve_measured(
         "age_hours": age_hours,
         "max_age_hours": max_age_hours,
     }
-    if min_physical is not None and value < min_physical:
+    if not math.isfinite(value) or (min_physical is not None and value < min_physical):
         return Measured(
             **common,
             value=None,
             verified=False,
             detail=(
                 f"последнее значение {tag} равно {value:g} и физически невозможно "
-                f"(ниже {min_physical:g}): как измерение не используется"
+                f"({'не конечно' if not math.isfinite(value) else f'ниже {min_physical:g}'}): "
+                "как измерение не используется"
             ),
         )
     if age_hours > max_age_hours:
@@ -176,6 +178,18 @@ def resolve_measured(
     )
 
 
+def _contributing(fractions: dict | None) -> dict:
+    """Компоненты с ненулевой долей — только они входят в показатель смеси.
+
+    Компонент с долей 0 в смеси отсутствует физически, поэтому отсутствие его
+    анализа не делает показатель смеси неизвестным: иначе «убрать компонент из
+    смеси» считалось бы не сертифицируемым из-за анализа, который смеси не
+    касается (ADR-019). Пустой состав возвращается как есть — его ловит
+    `constraints.check_blend_fractions`.
+    """
+    return {name: weight for name, weight in (fractions or {}).items() if float(weight) != 0.0}
+
+
 def blend_t95(fractions: dict, component_t95: dict) -> float | None:
     """T95 смеси массовым балансом: T95 = Σ wᵢ·T95ᵢ.
 
@@ -188,7 +202,7 @@ def blend_t95(fractions: dict, component_t95: dict) -> float | None:
     См. ADR-015.
     """
     total = 0.0
-    for name, weight in (fractions or {}).items():
+    for name, weight in _contributing(fractions).items():
         value = component_t95.get(name)
         if value is None:
             return None
@@ -205,7 +219,7 @@ def cetane_blend_index_form(fractions: dict, component_cetane: dict) -> float | 
     """
     exponent = CETANE_BLEND_INDEX_EXPONENT
     total = 0.0
-    for name, weight in (fractions or {}).items():
+    for name, weight in _contributing(fractions).items():
         value = component_cetane.get(name)
         if value is None or float(value) <= 0.0:
             return None
@@ -218,7 +232,7 @@ def cetane_blend_index_form(fractions: dict, component_cetane: dict) -> float | 
 def cetane_linear_form(fractions: dict, component_cetane: dict) -> float | None:
     """Цетановое число смеси линейным массовым балансом: CN = Σ wᵢ·CNᵢ."""
     total = 0.0
-    for name, weight in (fractions or {}).items():
+    for name, weight in _contributing(fractions).items():
         value = component_cetane.get(name)
         if value is None:
             return None
@@ -258,7 +272,7 @@ def blend_density(fractions: dict, component_density: dict) -> float | None:
     источник прямо разрешает пренебречь.
     """
     total = 0.0
-    for name, weight in (fractions or {}).items():
+    for name, weight in _contributing(fractions).items():
         value = component_density.get(name)
         if value is None or float(value) <= 0.0:
             return None

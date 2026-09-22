@@ -46,6 +46,13 @@ class _IndexedObservations:
     frame: pd.DataFrame
     availability_ns: np.ndarray
 
+    def __post_init__(self) -> None:
+        # Те же колонки массивами: iloc по строке на каждую цель — главная
+        # статья времени backtest. DatetimeArray[i] даёт тот же pd.Timestamp.
+        object.__setattr__(self, "_values", self.frame["value"].to_numpy(dtype=float))
+        object.__setattr__(self, "_timestamps", self.frame["timestamp"].array)
+        object.__setattr__(self, "_available", self.frame["available_at"].array)
+
 
 def _validate_long_format(frame: pd.DataFrame) -> None:
     required = {"timestamp", "available_at", "source", "tag", "value"}
@@ -83,8 +90,7 @@ def _latest(
     position = int(np.searchsorted(indexed.availability_ns, as_of.value, side="right") - 1)
     if position < 0:
         return None
-    row = indexed.frame.iloc[position]
-    return float(row["value"]), row["timestamp"], row["available_at"]
+    return float(indexed._values[position]), indexed._timestamps[position], indexed._available[position]
 
 
 def build_prediction_frame(
@@ -109,9 +115,14 @@ def build_prediction_frame(
     pak = _indexed_observations(frame, pak_tag)
     rows: list[dict] = []
     horizon = pd.Timedelta(hours=float(horizon_hours))
+    # Строки как словари, а не iterrows/iloc: построчный доступ pandas на
+    # каждую цель (×16 комбинаций горизонт/лаг) — основная статья времени.
+    # to_dict даёт те же pd.Timestamp и те же числа, что и строка iloc.
+    target_records = targets.frame[["timestamp", "value", "available_at"]].to_dict("records")
     synchronized = None
+    synchronized_records: list[dict] = []
     if telemetry is not None:
-        issue_times = [target["timestamp"] - horizon for _, target in targets.frame.iterrows()]
+        issue_times = [target["timestamp"] - horizon for target in target_records]
         synchronized = features.synchronize_features(
             issue_times,
             frame,
@@ -120,7 +131,8 @@ def build_prediction_frame(
             target_tag=target_tag,
             pak_tag=pak_tag,
         )
-    for target_position, (_, target) in enumerate(targets.frame.iterrows()):
+        synchronized_records = synchronized.to_dict("records")
+    for target_position, target in enumerate(target_records):
         target_time = target["timestamp"]
         issue_time = target_time - horizon
         if synchronized is None:
@@ -147,7 +159,7 @@ def build_prediction_frame(
                 "pak_missing": pak_value is None,
             }
         else:
-            synchronized_row = synchronized.iloc[target_position]
+            synchronized_row = synchronized_records[target_position]
             # См. ADR-008: без предыдущего доступного анализа persistence не определён.
             if bool(synchronized_row["lims_missing"]):
                 continue

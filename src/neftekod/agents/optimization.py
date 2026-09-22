@@ -38,6 +38,7 @@ SETPOINT_STEP_FRACTION = 0.05
 # не способ классификации ни для теста, ни для интерфейса оператора.
 REJECTION_CODES = (
     "hard_constraint",
+    "measured_violation",
     "insufficient_margin",
     "unvalidated_effect_model",
     "regime_inadmissible",
@@ -45,6 +46,9 @@ REJECTION_CODES = (
     "unmodelled_spec_effect",
     "unverified_spec_indicator",
 )
+# Единица, в которой ЛИМС выдаёт серу сырья: множитель 10⁴ верен только для
+# неё. Анализ в другой единице не пересчитывается молча (ADR-019).
+CUT_SULFUR_UNITS_PERCENT = frozenset({"% масс.", "% масс", "%масс.", "%", "масс. %"})
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,22 @@ def resolve_cut_sulfur(context: ScenarioContext, blending: BlendingScenario) -> 
         }
     last = published.sort_values("timestamp").iloc[-1]
     age_hours = (context.issue_time - pd.Timestamp(last["timestamp"])).total_seconds() / 3600.0
+    unit_declared = last.get("unit_declared")
+    unit = None if pd.isna(unit_declared) else str(unit_declared).strip()
+    if unit is not None and unit not in CUT_SULFUR_UNITS_PERCENT:
+        return {
+            "tag": blending.cut_sulfur_tag,
+            "value_mg_kg": None,
+            "value_declared": float(last["value"]),
+            "unit_declared": unit,
+            "refusal": {
+                "reason": (
+                    f"анализ {blending.cut_sulfur_tag} записан в единице {unit!r}, "
+                    "а множитель перевода задан только для % масс."
+                ),
+                "rule": "сера компонента в неизвестной единице не пересчитывается молча (ADR-019)",
+            },
+        }
     resolved = {
         "tag": blending.cut_sulfur_tag,
         "value_mg_kg": float(last["value"]) * blending.cut_sulfur_unit_factor,
@@ -125,7 +145,16 @@ def resolve_cut_sulfur(context: ScenarioContext, blending: BlendingScenario) -> 
         "evidence_type": "backtested",
         "refusal": None,
     }
-    if age_hours > blending.max_cut_sulfur_age_hours:
+    if not (float(last["value"]) > 0.0 and pd.notna(last["value"]) and abs(float(last["value"])) != float("inf")):
+        resolved["value_mg_kg"] = None
+        resolved["refusal"] = {
+            "reason": (
+                f"анализ сырья {blending.cut_sulfur_tag} нефизичен "
+                f"({float(last['value'])!r} {unit}): как измерение не используется"
+            ),
+            "rule": "сера компонента ≤ 0 или не число — дефект данных, а не измерение (ADR-019)",
+        }
+    elif age_hours > blending.max_cut_sulfur_age_hours:
         resolved["value_mg_kg"] = None
         resolved["refusal"] = {
             "reason": (
@@ -251,8 +280,15 @@ def _candidate(
     recommendation: dict,
     objective: dict,
     effect_model: dict | None,
+    measured_violations: list | None = None,
 ) -> dict:
     violations = constraints.validate_recommendation(recommendation)
+    # Доказанное нарушение по измеренному показателю продукта (ADR-019) —
+    # такое же жёсткое нарушение у каждого кандидата, включая статус-кво:
+    # анализ 10.5 мг/кг не становится допустимым от того, что прогноз 9.2.
+    violations += [
+        constraints.Violation(item["rule"], item["detail"]) for item in measured_violations or []
+    ]
     # Неподтверждённый показатель не блокирует статус-кво, но блокирует любое
     # изменение; доказанное нарушение блокирует всё. Пометка кладётся в саму
     # рекомендацию у каждого кандидата: пустой список — это утверждение «всё
@@ -271,11 +307,18 @@ def _candidate(
             for violation in violations
         ],
         "admissible": not blocking,
+        # Текущие уставки вне модельного диапазона p05–p95 у статус-кво — не
+        # нарушение, а предупреждение: режим уже там (ADR-019).
+        "out_of_model_range": constraints.out_of_model_range(violations)
+        if kind == "no_action"
+        else [],
         "rejection_reasons": [
             (
                 f"обязательный показатель {violation.rule} не подтверждён: изменение "
                 f"режима или состава не сертифицируется ({violation.detail})"
                 if violation.kind == constraints.UNVERIFIED
+                else f"доказанное нарушение спецификации {violation.rule}: {violation.detail}"
+                if violation.detail.startswith("измерен")
                 else f"жёсткое ограничение {violation.rule}: {violation.detail}"
             )
             for violation in blocking
@@ -283,6 +326,8 @@ def _candidate(
         "rejection_codes": [
             "unverified_spec_indicator"
             if violation.kind == constraints.UNVERIFIED
+            else "measured_violation"
+            if violation.detail.startswith("измерен")
             else "hard_constraint"
             for violation in blocking
         ],
@@ -312,8 +357,18 @@ def propose(
         "Кандидат, меняющий режим, дополнительно обязан оставить запас по сере "
         "не меньше backtest-RMSE прогноза на худшем из горизонтов действия "
         "(0–3 ч), а не на ближайшем: иначе выигрыш лежит внутри ошибки. "
-        "Сохранение текущего режима от этого требования освобождено — это не "
-        "действие, а статус-кво.",
+        "Требование не распространяется на действие, которое не уменьшает "
+        "запас по сере относительно статус-кво: оно не рискованнее сохранения "
+        "режима (ADR-019). Сохранение текущего режима от требования освобождено "
+        "— это не действие, а статус-кво.",
+        "Измеренные показатели продукта — сера последнего анализа, T95, "
+        "цетановое число и плотность — сравниваются с пределами как факт, "
+        "независимо от прогноза: доказанное нарушение отклоняет всех кандидатов, "
+        "включая сохранение режима, кодом measured_violation (ADR-019).",
+        "Текущая уставка вне модельного диапазона p05–p95 не делает сохранение "
+        "режима недопустимым — режим уже там, а p05–p95 не промышленный предел "
+        "(ТЗ, §4); допустимость режима оценивает агент надёжности. Для любого "
+        "изменения уставок диапазон остаётся жёстким (ADR-019).",
         "Если контроль качества входа пометил последний анализ как аномальный "
         "(ADR-014), действия не рекомендуются вовсе: сохранение режима остаётся "
         "допустимым, а менять режим по подозрительному измерению нельзя.",
@@ -342,9 +397,12 @@ def propose(
         "моделируется: модели нет, а подставлять текущее измерение как прогноз "
         "после действия нельзя. Поэтому кандидат, меняющий уставки, отклоняется "
         "кодом unmodelled_spec_effect независимо от результата по сере (ADR-015).",
-        "Среди допустимых выбирается минимальный стоимостный прокси; при "
-        "равенстве остаётся сохранение текущего режима. Экономика решает только "
-        "между уже допустимыми вариантами и никогда не делает вариант допустимым.",
+        "Среди допустимых при риске качества high или доказанном нарушении "
+        "выбирается наибольший запас по сере — качество приоритетнее экономики "
+        "(ТЗ, §1); при риске moderate/low выбирается минимальный стоимостный "
+        "прокси. При равенстве остаётся сохранение текущего режима. Экономика "
+        "решает только между уже допустимыми вариантами и никогда не делает "
+        "вариант допустимым (ADR-019).",
     ]
 
     cut = resolve_cut_sulfur(context, blending)
@@ -376,16 +434,17 @@ def propose(
             },
         )
 
-    horizon = min(context.backtest)
-    baseline_forecast = next(item for item in quality.forecast if item["horizon_hours"] == horizon)
-    baseline_sulfur = baseline_forecast["predicted_sulfur_mg_kg"]
-    # Порог действия берётся по ХУДШЕМУ горизонту, а не по ближайшему:
-    # рекомендация действует на 0–3 часа (ответы организаторов), и настраивать
-    # «гейт» на самую выгодную из измеренных ошибок значит пропускать впритык
-    # то, что на реальном горизонте действия не проходит. См. ADR-010.
+    # Порог действия и прогноз серы берутся по ХУДШЕМУ горизонту, а не по
+    # ближайшему: рекомендация действует на 0–3 часа (ответы организаторов), и
+    # настраивать «гейт» на самую выгодную из измеренных ошибок значит
+    # пропускать впритык то, что на реальном горизонте действия не проходит.
+    # Оркестратор сверяет пакет с тем же горизонтом (ADR-010, ADR-019).
     worst = max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"])
+    baseline_sulfur = worst["predicted_sulfur_mg_kg"]
     forecast_rmse = worst["backtest_rmse_mg_kg"]
     forecast_rmse_horizon = worst["horizon_hours"]
+    quality_risk = worst["risk_exceed_spec"]
+    measured_violations = list(quality.measured_violations or [])
     current_setpoints = {
         tag: context.snapshot[f"{tag}_value"] for tag in features.TELEMETRY_TAGS
     }
@@ -499,8 +558,10 @@ def propose(
                 **spec_margins(current_fraction),
             },
             effect_model=None,
+            measured_violations=measured_violations,
         )
     ]
+    status_quo_margin = candidates[0]["objective"]["sulfur_margin_mg_kg"]
 
     for share in blending.candidate_fractions_of_max:
         fraction = share * max_fraction
@@ -560,6 +621,7 @@ def propose(
                         "сама доля исторически не проверялась"
                     ),
                 },
+                measured_violations=measured_violations,
             )
         )
 
@@ -608,6 +670,7 @@ def propose(
                             **spec_margins(current_fraction),
                         },
                         effect_model=effect_model.to_dict(),
+                        measured_violations=measured_violations,
                     )
                 )
 
@@ -616,10 +679,15 @@ def propose(
         codes = list(candidate["rejection_codes"])
         if candidate["kind"] != "no_action":
             margin = candidate["objective"]["sulfur_margin_mg_kg"]
-            if margin < forecast_rmse:
+            # Действие, не уменьшающее запас по сере относительно статус-кво, не
+            # рискованнее сохранения режима: гейт «запас ≥ RMSE» к нему не
+            # применяется (ADR-019). Жёсткие проверки остальных показателей
+            # действуют как обычно.
+            if margin < forecast_rmse and margin < status_quo_margin - 1e-12:
                 reasons.append(
                     f"запас по сере {margin:.3g} мг/кг меньше backtest-RMSE прогноза "
-                    f"{forecast_rmse:.3g} мг/кг на худшем горизонте {forecast_rmse_horizon:g} ч: "
+                    f"{forecast_rmse:.3g} мг/кг на худшем горизонте {forecast_rmse_horizon:g} ч "
+                    f"и меньше запаса статус-кво {status_quo_margin:.3g} мг/кг: "
                     "выигрыш неотличим от ошибки"
                 )
                 codes.append("insufficient_margin")
@@ -659,6 +727,9 @@ def propose(
 
     admissible = [item for item in candidates if item["admissible"]]
     if not admissible:
+        # Причина отказа называет, почему не прошёл даже статус-кво: «ни один
+        # кандидат» без деталей оператору ничего не говорит (ADR-019).
+        hold_reasons = "; ".join(candidates[0]["rejection_reasons"])
         return OptimizationProposal(
             issue_time=issue_time,
             candidates=candidates,
@@ -668,14 +739,34 @@ def propose(
             blending_inputs=cut,
             spec_inputs={"cut_t95": cut_t95.to_dict(), "cut_density": cut_density.to_dict()},
             refusal={
-                "reason": "ни один кандидат не прошёл проверки",
+                "reason": (
+                    "ни один кандидат не прошёл проверки; сохранение режима отклонено: "
+                    + hold_reasons
+                ),
                 "rule": "при отсутствии допустимого варианта рекомендация не выдаётся (ТЗ, §4)",
             },
         )
-    best = min(
-        admissible,
-        key=lambda item: (item["objective"]["cost_proxy_rel"], item["kind"] != "no_action", item["id"]),
-    )
+    # Качество приоритетнее экономики (ТЗ, §1): при риске high среди допустимых
+    # выбирается наибольший запас по сере, иначе — минимальная стоимость.
+    # Тай-брейк — статус-кво, затем id: выбор детерминирован (ADR-019).
+    if quality_risk in ("high", "spec_violation_predicted", quality_module.RISK_MEASURED_VIOLATION):
+        best = min(
+            admissible,
+            key=lambda item: (
+                -item["objective"]["sulfur_margin_mg_kg"],
+                item["kind"] != "no_action",
+                item["id"],
+            ),
+        )
+    else:
+        best = min(
+            admissible,
+            key=lambda item: (
+                item["objective"]["cost_proxy_rel"],
+                item["kind"] != "no_action",
+                item["id"],
+            ),
+        )
     return OptimizationProposal(
         issue_time=issue_time,
         candidates=candidates,
@@ -711,19 +802,14 @@ def build_submission(
         context.long_format, context.issue_time
     ).to_dict()
     product = quality.spec_indicators or {}
-    horizon = min(context.backtest)
-    baseline = (
-        next((item for item in quality.forecast if item["horizon_hours"] == horizon), None)
-        if quality.forecast
-        else None
-    )
-    # Оркестратор получает тот же порог, каким пользовался оптимизатор:
-    # худший горизонт действия, а не ближайший (см. ADR-010).
+    # Оркестратор получает тот же горизонт и тот же порог, какими пользовался
+    # оптимизатор: худший горизонт действия, а не ближайший (ADR-010, ADR-019).
     worst = (
         max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"])
         if quality.forecast
         else None
     )
+    baseline = worst
     return {
         "input": {
             "scenario": context.scenario,

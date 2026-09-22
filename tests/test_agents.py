@@ -13,7 +13,7 @@ import dataclasses
 import pandas as pd
 import pytest
 
-from neftekod import config, constraints, features, spec
+from neftekod import config, constraints, features, scenarios, spec
 from neftekod.agents import context as context_module
 from neftekod.agents import optimization, orchestrator, quality, reliability, report
 
@@ -532,12 +532,26 @@ class TestOptimization:
         assert max(values) - min(values) < 0.1
 
     def test_unverified_cut_density_blocks_every_change_but_not_hold(self):
-        """Неизмеренная плотность компонента — не «возьмём плотность продукта»."""
-        context = _context(long_format=_long_format(cut_density=None))
+        """Неизмеренная плотность компонента — не «возьмём плотность продукта».
+
+        Блокируется любое изменение, в котором этот компонент есть. Убрать его
+        из смеси (доля 0) анализа компонента не требует (ADR-019), поэтому при
+        риске moderate/low остаётся hold с пометкой, а f0 допустим.
+        """
+        context = _context(long_format=_long_format(cut_density=None, sulfur=3.0, history_values=WIDE_HISTORY))
         proposal = optimization.propose(
             context, quality.assess(context), reliability.assess(context)
         )
-        self._assert_only_hold_survives(proposal, "density")
+        assert proposal.recommended_id == "hold"
+        assert proposal.recommended()["recommendation"]["unverified_spec_indicators"] == ["density"]
+        for candidate in proposal.candidates:
+            if candidate["kind"] == "no_action":
+                continue
+            if candidate["objective"]["cut_component_share"] == 0.0:
+                assert "unverified_spec_indicator" not in candidate["rejection_codes"], candidate["id"]
+                continue
+            assert not candidate["admissible"], candidate["id"]
+            assert "unverified_spec_indicator" in candidate["rejection_codes"], candidate["id"]
 
     def test_margin_gate_uses_the_worst_horizon_not_the_most_favourable(self):
         """Порог действия берётся по худшему горизонту, на который оно влияет."""
@@ -551,7 +565,14 @@ class TestOptimization:
         }
         context = _context(backtest=backtest)
         proposal = self._proposal(context)
-        blend = next(item for item in proposal.candidates if item["kind"] == "blend")
+        # Кандидат, уменьшающий запас (доля больше текущей): к f0 гейт не
+        # применяется (ADR-019).
+        current = optimization.BlendingScenario().current_cut_fraction
+        blend = next(
+            item
+            for item in proposal.candidates
+            if item["kind"] == "blend" and item["objective"]["cut_component_share"] > current
+        )
         assert any("9.5" in reason for reason in blend["rejection_reasons"])
         assert not any("2.6 мг/кг" in reason for reason in blend["rejection_reasons"])
 
@@ -661,9 +682,88 @@ class TestOptimization:
         assert proposal.candidates == []
         assert "старше" in proposal.refusal["reason"]
 
-    def test_stable_period_recommends_holding(self, scenario_context):
-        proposal = self._proposal(scenario_context)
+    def test_stable_period_recommends_holding(self):
+        """При риске moderate/low экономика решает между допустимыми — остаётся hold."""
+        context = _context(long_format=_long_format(sulfur=3.0, history_values=WIDE_HISTORY))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
         assert proposal.recommended_id == "hold"
+        # Убрать модельный компонент допустимо, но дороже — и не выбирается.
+        pure = next(item for item in proposal.candidates if item["id"].endswith("_f0"))
+        assert pure["admissible"], pure["rejection_reasons"]
+
+    def test_high_risk_prefers_the_largest_sulfur_margin_over_cost(self, scenario_context):
+        """Качество приоритетнее экономики (ТЗ, §1; ADR-019).
+
+        Риск high: hold с модельной долей сернистого компонента допустим, но
+        «убрать компонент» даёт больший запас по сере — и выбирается, хотя
+        стоимостный прокси у него выше.
+        """
+        proposal = self._proposal(scenario_context)
+        hold = next(item for item in proposal.candidates if item["kind"] == "no_action")
+        chosen = proposal.recommended()
+        assert hold["admissible"]
+        assert chosen["kind"] == "blend"
+        assert chosen["objective"]["cut_component_share"] == 0.0
+        assert chosen["objective"]["sulfur_margin_mg_kg"] > hold["objective"]["sulfur_margin_mg_kg"]
+        assert chosen["objective"]["cost_proxy_rel"] > hold["objective"]["cost_proxy_rel"]
+
+    def test_action_that_improves_sulfur_margin_is_not_gated_by_rmse(self, scenario_context):
+        """Гейт «запас ≥ RMSE» не применяется к действию, не уменьшающему запас (ADR-019)."""
+        proposal = self._proposal(scenario_context)
+        pure = next(item for item in proposal.candidates if item["id"].endswith("_f0"))
+        assert "insufficient_margin" not in pure["rejection_codes"], pure["rejection_reasons"]
+        current = optimization.BlendingScenario().current_cut_fraction
+        richer = [
+            item
+            for item in proposal.candidates
+            if item["kind"] == "blend" and item["objective"]["cut_component_share"] > current
+        ]
+        assert richer
+        for candidate in richer:
+            assert "insufficient_margin" in candidate["rejection_codes"], candidate["id"]
+
+    def test_measured_sulfur_violation_blocks_hold(self):
+        """Анализ 10.5 мг/кг: прогноз 9.2 < 10, но нарушение доказано (ADR-019)."""
+        context = _context(long_format=_long_format(sulfur=10.5))
+        assessment = quality.assess(context)
+        assert assessment.refusal is None
+        assert any(item["rule"] == "sulfur" for item in assessment.measured_violations)
+        assert all(item["risk_exceed_spec"] == "spec_violation_measured" for item in assessment.forecast)
+        proposal = optimization.propose(context, assessment, reliability.assess(context))
+        assert proposal.recommended_id is None
+        for candidate in proposal.candidates:
+            assert "measured_violation" in candidate["rejection_codes"], candidate["id"]
+
+    def test_measured_product_violation_is_not_masked_by_missing_cut_analysis(self):
+        """T95 продукта 370 °C при отсутствии анализа компонента — нарушение, не «не подтверждён»."""
+        context = _context(long_format=_long_format(product_t95=370.0, cut_t95=None))
+        assessment = quality.assess(context)
+        assert assessment.spec_indicators["t95"]["value"] == 370.0
+        proposal = optimization.propose(context, assessment, reliability.assess(context))
+        hold = next(item for item in proposal.candidates if item["kind"] == "no_action")
+        assert hold["admissible"] is False
+        assert "measured_violation" in hold["rejection_codes"]
+
+    def test_hold_survives_current_setpoint_slightly_outside_model_range(self):
+        """Текущая уставка вне p05–p95 не делает статус-кво недопустимым (ADR-019)."""
+        context = _context(telemetry=_telemetry({"P8": 0.31}))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        hold = next(item for item in proposal.candidates if item["kind"] == "no_action")
+        assert hold["admissible"], hold["rejection_reasons"]
+        assert hold["out_of_model_range"], "выход за диапазон должен быть назван"
+        setpoints = [item for item in proposal.candidates if item["kind"] == "setpoint"]
+        assert not setpoints or all(not item["admissible"] for item in setpoints)
+
+    def test_nonphysical_last_analysis_refuses_forecast(self):
+        context = _context(long_format=_long_format(sulfur=-5.0))
+        assessment = quality.assess(context)
+        assert assessment.refusal is not None
+        assert "нефизичен" in assessment.refusal["reason"]
+        assert assessment.forecast == []
 
     def test_refuses_when_quality_refused(self):
         context = _context(long_format=_long_format(last_sample="2026-01-30 10:00:00"))
@@ -683,11 +783,11 @@ def _submission(context) -> tuple[dict, dict]:
     submission = optimization.build_submission(
         context, quality_assessment, reliability_assessment, proposal
     )
-    sources = {
-        "quality": quality_assessment.to_dict(),
-        "reliability": reliability_assessment.to_dict(),
-        "snapshot": context.snapshot,
-    }
+    # Источники собираются той же функцией, что и в прогоне сценария: без
+    # показателей компонента и текущего состава оркестратор отказывает (ADR-019).
+    sources = scenarios.independent_sources(
+        context, quality_assessment, reliability_assessment, optimization.BlendingScenario()
+    )
     return submission, sources
 
 
@@ -714,9 +814,11 @@ class TestOrchestratorUnverified:
         Предупреждение обязано назвать, чьего значения не хватает: иначе оператор
         пойдёт проверять анализ продукта, который как раз свежий.
         """
-        submission, sources = _submission(_context(long_format=_long_format(cut_density=None)))
+        context = _context(long_format=_long_format(cut_density=None, sulfur=3.0, history_values=WIDE_HISTORY))
+        submission, sources = _submission(context)
         decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "approved", decision.rejection_reasons
+        assert decision.recommendation["action"] == "hold"
         [warning] = [item for item in decision.warnings if "плотность" in item]
         assert "straight_run_240_350" in warning
         assert "hydrotreated_diesel" not in warning
@@ -776,8 +878,76 @@ class TestOrchestrator:
         submission, sources = _submission(scenario_context)
         decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "approved"
-        assert decision.recommendation["action"] == "hold"
-        assert all(check["passed"] for check in decision.checks)
+        # Риск high: выбран вариант с наибольшим запасом — убрать сернистый
+        # компонент (ADR-019); оркестратор воспроизводит все проверки.
+        assert decision.recommendation["action"] == "adjust_blend"
+        assert all(check["passed"] for check in decision.checks), [
+            check for check in decision.checks if not check["passed"]
+        ]
+
+    def test_improving_action_passes_quality_risk_gate_without_rmse_cover(self, scenario_context):
+        """Действие с запасом ≥ статус-кво проходит гейт риска и без запаса ≥ RMSE."""
+        submission, sources = _submission(scenario_context)
+        decision = orchestrator.review(submission, sources=sources)
+        check = next(item for item in decision.checks if item["check"] == "action_allowed_under_quality_risk")
+        assert check["passed"], check
+        assert "запас статус-кво" in check["detail"]
+
+    def test_tampered_cut_component_sulfur_is_rejected(self, scenario_context):
+        """Заниженная сера компонента во входе ловится независимым источником (ADR-019)."""
+        submission, sources = _submission(scenario_context)
+        submission["input"]["components"]["straight_run_240_350"]["sulfur_mg_kg"] = 0.0
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("straight_run_240_350.sulfur_mg_kg" in reason for reason in decision.rejection_reasons)
+
+    def test_tampered_current_fractions_cannot_fake_status_quo(self, scenario_context):
+        submission, sources = _submission(scenario_context)
+        blend = submission["recommendation"]
+        submission["input"]["current_blend_fractions"] = dict(blend["blend_fractions"])
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("текущий состав" in reason for reason in decision.rejection_reasons)
+
+    def test_package_without_blend_fractions_is_rejected(self, scenario_context):
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"].pop("blend_fractions")
+        submission["recommendation"]["predicted_sulfur_mg_kg"] = 1.0
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("blend_fractions" in reason for reason in decision.rejection_reasons)
+
+    def test_measured_sulfur_violation_is_recomputed_by_orchestrator(self):
+        context = _context(long_format=_long_format(sulfur=10.5))
+        submission, sources = _submission(context)
+        hold = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        ).candidates[0]
+        submission["recommendation"] = hold["recommendation"]
+        submission["applied_constraints"]["quality_risk_exceed_spec"] = "spec_violation_measured"
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("доказанное нарушение" in reason for reason in decision.rejection_reasons)
+
+    def test_status_quo_outside_model_range_is_a_warning_not_a_rejection(self):
+        context = _context(telemetry=_telemetry({"P8": 0.31}), long_format=_long_format(sulfur=3.0, history_values=WIDE_HISTORY))
+        submission, sources = _submission(context)
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "approved", decision.rejection_reasons
+        assert any("модельного диапазона" in warning for warning in decision.warnings)
+
+    def test_backtested_claimed_for_a_change_is_rejected(self, scenario_context):
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"]["evidence_type"] = "backtested"
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("backtested" in reason for reason in decision.rejection_reasons)
+
+    def test_inf_in_package_is_a_violation_not_a_traceback(self, scenario_context):
+        submission, sources = _submission(scenario_context)
+        submission["recommendation"]["predicted_t95_c"] = float("inf")
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
 
     def test_high_quality_risk_is_warned_even_when_approved(self, scenario_context):
         submission, sources = _submission(scenario_context)

@@ -63,8 +63,13 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
         if item is None:
             continue
         value = "отсутствует" if item.get("missing") else _fmt(item.get("value"), 6)
+        freshness = _age(item.get("age_hours"))
+        if item.get("frozen"):
+            # Залипший анализатор выглядит как свежее измерение (возраст 0 ч):
+            # без этой пометки оператор считал бы ПАК живым (ADR-019).
+            freshness += f"; **ЗАЛИП**: одно и то же число {_age(item.get('frozen_hours'))[8:]}"
         lines.append(
-            f"| {title} | {value} | {_age(item.get('age_hours'))} | "
+            f"| {title} | {value} | {freshness} | "
             f"{'да' if item.get('units_confirmed') else 'нет — ' + UNITS_NOT_CONFIRMED} |"
         )
     indicators = quality.spec_indicators or {}
@@ -79,6 +84,14 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
         ]
         t95 = indicators.get("t95") or {}
         cetane = indicators.get("cetane_number") or {}
+        sulfur = indicators.get("sulfur") or {}
+        if sulfur:
+            lines.append(
+                f"| Сера (последний анализ), мг/кг | {_fmt(sulfur.get('value'), 5)} | "
+                f"≤ {config.SULFUR_LIMIT_MG_KG:g} | {_fmt(sulfur.get('margin_mg_kg'), 3)} | "
+                f"{_age(sulfur.get('age_hours'))} | "
+                f"{'да' if sulfur.get('verified') else 'НЕТ — ' + str(sulfur.get('detail'))} |"
+            )
         lines.append(
             f"| T95, °C | {_fmt(t95.get('value'), 5)} | ≤ {config.T95_LIMIT_C:g} | "
             f"{_fmt(t95.get('margin_c'), 3)} | {_age(t95.get('age_hours'))} | "
@@ -116,7 +129,8 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
             "",
             f"Тяжесть режима (прокси): {reliability.severity_index:.4g} — класс "
             f"`{reliability.severity_class}`, режим "
-            f"{'допустим' if reliability.regime_admissible else 'недопустим'}.",
+            f"{'допустим' if reliability.regime_admissible else 'недопустим'}"
+            + (" — **установка остановлена** (T11 ниже порога останова, ADR-019)." if getattr(reliability, "plant_stopped", False) else "."),
         ]
     return lines
 
@@ -124,6 +138,17 @@ def _state_block(decision, quality, reliability, submission) -> list[str]:
 def _risk_block(decision, quality, reliability, proposal) -> list[str]:
     lines = []
     anomaly = quality.input_anomaly or {}
+    for item in getattr(quality, "measured_violations", None) or []:
+        lines.append(
+            f"- **Доказанное нарушение спецификации по измерению**: {item['detail']}. "
+            "Блокирует и сохранение режима (ADR-019)."
+        )
+    pak = (quality.data_confidence or {}).get("pak_sulfur") or {}
+    if pak.get("frozen"):
+        lines.append(
+            f"- **ПАК залип**: показание {_fmt(pak.get('value'), 6)} мг/кг не меняется "
+            f"{_age(pak.get('frozen_hours'))[8:]} — как свежее измерение не используется (ADR-019)."
+        )
     if anomaly.get("anomalous"):
         band = anomaly.get("training_band") or []
         lines.append(
@@ -231,10 +256,19 @@ def _effect_block(decision, proposal, submission) -> list[str]:
     current_cut = next(
         (value for name, value in current_share.items() if name != "hydrotreated_diesel"), None
     )
+    hold = next((item for item in proposal.candidates if item["kind"] == "no_action"), None)
+    hold_sulfur = None if hold is None else hold["recommendation"].get("predicted_sulfur_mg_kg")
+    versus_hold = (
+        f" Статус-кво дал бы {hold_sulfur:.4g} мг/кг: действие "
+        f"{'снижает' if recommendation['predicted_sulfur_mg_kg'] < hold_sulfur else 'не снижает'} серу "
+        f"на {abs(hold_sulfur - recommendation['predicted_sulfur_mg_kg']):.3g} мг/кг."
+        if hold_sulfur is not None and recommendation.get("action") != "hold"
+        else ""
+    )
     lines = [
         f"- Прогноз серы товарного ДТ: **{recommendation['predicted_sulfur_mg_kg']:.4g} мг/кг** "
         f"при пределе {config.SULFUR_LIMIT_MG_KG:g} мг/кг "
-        f"(запас {objective.get('sulfur_margin_mg_kg', float('nan')):.4g} мг/кг).",
+        f"(запас {objective.get('sulfur_margin_mg_kg', float('nan')):.4g} мг/кг).{versus_hold}",
         f"- Прогноз T95 смеси: **{_fmt(recommendation.get('predicted_t95_c'), 5)} °C** "
         f"при пределе {config.T95_LIMIT_C:g} °C (запас "
         f"{_fmt(objective.get('t95_margin_c'), 3)} °C). Модель смешения — массовый "
@@ -318,6 +352,16 @@ def _confidence_block(quality, proposal) -> list[str]:
         for name, item in (quality.data_confidence or {}).items()
         if item.get("missing") or (item.get("age_hours") or 0) > 24
     ]
+    stale += [
+        f"ПАК залип ({_age(item.get('frozen_hours'))[8:]})"
+        for name, item in (quality.data_confidence or {}).items()
+        if item.get("frozen")
+    ]
+    stale += [
+        f"{name}: {item.get('detail')}"
+        for name, item in (quality.spec_indicators or {}).items()
+        if isinstance(item, dict) and "verified" in item and not item.get("verified")
+    ]
     if stale:
         lines.append("- **Предупреждение о старых или пропущенных данных**: " + "; ".join(stale) + ".")
     else:
@@ -396,6 +440,47 @@ def _explanation_block(decision, proposal) -> list[str]:
     return lines
 
 
+def _summary(decision, quality, reliability, proposal) -> list[str]:
+    """Три строки для оператора: ситуация → действие → почему. Числа — из вывода ролей."""
+    worst = max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"]) if quality.forecast else None
+    if quality.refusal:
+        situation = f"нет обоснованного прогноза серы — {quality.refusal['reason']}"
+    else:
+        situation = (
+            f"последний анализ серы {worst['last_published_sulfur_mg_kg']:.4g} мг/кг, прогноз "
+            f"{worst['predicted_sulfur_mg_kg']:.4g} при пределе {config.SULFUR_LIMIT_MG_KG:g}, "
+            f"риск `{worst['risk_exceed_spec']}`"
+        )
+    if getattr(reliability, "plant_stopped", False):
+        situation += "; установка остановлена"
+    elif reliability.severity_index is not None:
+        situation += f"; режим {'допустим' if reliability.regime_admissible else 'недопустим'} (тяжесть {reliability.severity_index:.2g})"
+    recommendation = decision.recommendation
+    if recommendation is None:
+        action = f"действий нет — вердикт `{decision.verdict}`"
+        why = decision.rejection_reasons[0] if decision.rejection_reasons else decision.explanation
+    elif recommendation.get("action") == "hold":
+        action = "сохранить текущий режим и состав"
+        why = "ни одно изменение не прошло проверки; статус-кво допустим"
+        if recommendation.get("unverified_spec_indicators"):
+            why += f" с пометкой «не подтверждено»: {', '.join(recommendation['unverified_spec_indicators'])}"
+    else:
+        chosen = proposal.recommended() or {}
+        action = chosen.get("description", recommendation.get("action"))
+        why = (
+            f"среди допустимых вариантов выбран наибольший запас по сере "
+            f"({chosen.get('objective', {}).get('sulfur_margin_mg_kg', float('nan')):.3g} мг/кг): "
+            "качество приоритетнее экономики (ADR-019)"
+        )
+    return [
+        "**Коротко**",
+        "",
+        f"- Ситуация: {situation}.",
+        f"- Действие: {action}.",
+        f"- Почему: {why}.",
+    ]
+
+
 def recommendation_markdown(title, decision, quality, reliability, proposal, submission) -> str:
     """Собрать карточку оператора: семь блоков §5 плюс границы проверки."""
     blocks = {
@@ -408,6 +493,7 @@ def recommendation_markdown(title, decision, quality, reliability, proposal, sub
         "Объяснение выбора": _explanation_block(decision, proposal),
     }
     lines = [f"# {title}", "", f"Вердикт оркестратора: **{decision.verdict}**", ""]
+    lines += _summary(decision, quality, reliability, proposal) + [""]
     for index, name in enumerate(SECTIONS, start=1):
         lines += [f"## {index}. {name}", ""] + blocks[name] + [""]
     lines += ["## Чего проверка не доказывает", ""]

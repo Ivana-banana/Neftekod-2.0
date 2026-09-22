@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import config, features
+from . import spec as spec_module
 from .agents import (
     card,
     context as context_module,
@@ -124,8 +125,57 @@ def _scenario_input(spec: ScenarioSpec, scenario_context) -> dict:
     }
 
 
-def execute(spec: ScenarioSpec, *, blending: optimization.BlendingScenario | None = None) -> ScenarioRun:
-    """Прогнать цепочку ролей на окне сценария. Случайности в прогоне нет."""
+def independent_sources(
+    scenario_context,
+    quality: quality_agent.QualityAssessment,
+    reliability: reliability_agent.ReliabilityAssessment,
+    blending: optimization.BlendingScenario,
+) -> dict:
+    """Источники для оркестратора, собранные без участия агента оптимизации.
+
+    Показатели дешёвого компонента разрешаются из данных здесь заново, а
+    текущий состав берётся из постановки блендинга: агент оптимизации не может
+    занизить серу компонента или объявить новую долю «текущей» внутри пакета
+    (ADR-019).
+    """
+    cut = optimization.resolve_cut_sulfur(scenario_context, blending)
+    return {
+        "quality": quality.to_dict(),
+        "reliability": reliability.to_dict(),
+        "snapshot": scenario_context.snapshot,
+        "components": {
+            blending.cut_component: {
+                "sulfur_mg_kg": cut["value_mg_kg"],
+                "t95_c": spec_module.resolve_cut_t95(
+                    scenario_context.long_format, scenario_context.issue_time
+                ).value,
+                "cetane_number": blending.cut_cetane_number,
+                "density_kg_m3": spec_module.resolve_cut_density(
+                    scenario_context.long_format, scenario_context.issue_time
+                ).value,
+            }
+        },
+        "current_blend_fractions": {
+            blending.base_component: 1.0 - blending.current_cut_fraction,
+            blending.cut_component: blending.current_cut_fraction,
+        },
+    }
+
+
+def execute(
+    spec: ScenarioSpec,
+    *,
+    blending: optimization.BlendingScenario | None = None,
+    long_format=None,
+    telemetry=None,
+    backtest: dict | None = None,
+) -> ScenarioRun:
+    """Прогнать цепочку ролей на окне сценария. Случайности в прогоне нет.
+
+    long_format / telemetry / backtest можно передать уже прочитанными: при
+    прогоне нескольких сценариев подряд одни и те же файлы не перечитываются.
+    Содержимое — то же, что load_context прочитал бы сам.
+    """
     blending = blending or optimization.BlendingScenario()
     log.info("%s", blending.mock_notice())
     log.info(
@@ -134,7 +184,14 @@ def execute(spec: ScenarioSpec, *, blending: optimization.BlendingScenario | Non
         spec.window_start,
         spec.issue_time,
     )
-    scenario_context = context_module.load_context(spec.name, spec.issue_time, spec.window_start)
+    scenario_context = context_module.load_context(
+        spec.name,
+        spec.issue_time,
+        spec.window_start,
+        long_format=long_format,
+        telemetry=telemetry,
+        backtest=backtest,
+    )
     quality = quality_agent.assess(scenario_context)
     log.info(
         "агент качества: %s",
@@ -175,11 +232,7 @@ def execute(spec: ScenarioSpec, *, blending: optimization.BlendingScenario | Non
     # агента оптимизации, а не с копиями внутри пакета (ADR-010).
     decision = orchestrator.review(
         submission,
-        sources={
-            "quality": quality.to_dict(),
-            "reliability": reliability.to_dict(),
-            "snapshot": scenario_context.snapshot,
-        },
+        sources=independent_sources(scenario_context, quality, reliability, blending),
     )
     log.info("оркестратор: %s", decision.verdict)
     return ScenarioRun(

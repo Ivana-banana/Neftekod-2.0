@@ -16,7 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .. import anomaly, config, spec
+import pandas as pd
+
+from .. import anomaly, config, constraints, features, spec, splits
 from .context import TRAINING_FEATURES, ScenarioContext
 
 BASELINE_MODEL = "shrunk_persistence"
@@ -24,6 +26,13 @@ BASELINE_MODEL = "shrunk_persistence"
 # означает, что как минимум одна проба пропущена: прогноз на таком
 # основании не выдаётся. Модельное допущение сценария — см. ADR-010.
 MAX_BASELINE_AGE_HOURS = 48.0
+# ПАК, повторяющий одно и то же число дольше этого срока, считается залипшим
+# сигналом, а не свежим измерением. Порог тот же, что у телеметрии в ADR-018
+# (6 строк по 10 минут = 1 час), см. ADR-019.
+PAK_FROZEN_MIN_HOURS = 1.0
+# Измеренное нарушение спецификации — отдельный класс риска: это не прогноз,
+# а факт, и он блокирует даже сохранение режима (ADR-019).
+RISK_MEASURED_VIOLATION = "spec_violation_measured"
 
 
 @dataclass(frozen=True)
@@ -36,6 +45,9 @@ class QualityAssessment:
     assumptions: list
     input_anomaly: dict = field(default_factory=dict)
     spec_indicators: dict = field(default_factory=dict)
+    # Доказанные нарушения по измеренным показателям продукта (ADR-019):
+    # пустой список — утверждение «измеренных нарушений нет».
+    measured_violations: list = field(default_factory=list)
     refusal: dict | None = None
     agent: str = field(default="quality", init=False)
 
@@ -50,6 +62,7 @@ class QualityAssessment:
             "data_confidence": self.data_confidence,
             "input_anomaly": self.input_anomaly,
             "spec_indicators": self.spec_indicators,
+            "measured_violations": self.measured_violations,
             "assumptions": self.assumptions,
         }
 
@@ -88,6 +101,32 @@ def _training_range(context: ScenarioContext) -> dict:
     return report
 
 
+def _pak_frozen_hours(context: ScenarioContext) -> float | None:
+    """Сколько часов ПАК повторяет одно и то же число к моменту выдачи.
+
+    Залипший поточный анализатор выглядит как свежее измерение с возрастом
+    0 ч; в выгрузке NaN нет, поэтому дефект находится по серии одинаковых
+    значений, как у телеметрии (ADR-018). Считается по опубликованным к моменту
+    выдачи значениям — заглядывать в будущее серия не может.
+    """
+    frame = context.long_format
+    part = frame[frame["tag"].eq(features.PAK_SULFUR_TAG)].copy()
+    part["value"] = pd.to_numeric(part["value"], errors="coerce")
+    part = part.dropna(subset=["value"])
+    published = splits.available_history(part, context.issue_time)
+    if published.empty:
+        return None
+    published = published.sort_values("timestamp", kind="mergesort")
+    values = published["value"].to_numpy(dtype=float)
+    stamps = pd.to_datetime(published["timestamp"]).to_numpy()
+    start = len(values) - 1
+    while start > 0 and values[start - 1] == values[-1]:
+        start -= 1
+    if start == len(values) - 1:
+        return 0.0
+    return float((context.issue_time - pd.Timestamp(stamps[start])).total_seconds() / 3600.0)
+
+
 def _data_confidence(context: ScenarioContext) -> dict:
     snapshot = context.snapshot
     sources = {
@@ -96,7 +135,7 @@ def _data_confidence(context: ScenarioContext) -> dict:
     }
     for tag in ("P8", "T11", "F19"):
         sources[tag] = (f"{tag}_value", f"{tag}_age_hours", f"{tag}_missing")
-    return {
+    confidence = {
         name: {
             "value": snapshot.get(value_key),
             "age_hours": snapshot.get(age_key),
@@ -108,6 +147,12 @@ def _data_confidence(context: ScenarioContext) -> dict:
         }
         for name, (value_key, age_key, missing_key) in sources.items()
     }
+    frozen_hours = None if confidence["pak_sulfur"]["missing"] else _pak_frozen_hours(context)
+    confidence["pak_sulfur"]["frozen_hours"] = frozen_hours
+    confidence["pak_sulfur"]["frozen"] = (
+        frozen_hours is not None and frozen_hours >= PAK_FROZEN_MIN_HOURS
+    )
+    return confidence
 
 
 def assess(context: ScenarioContext) -> QualityAssessment:
@@ -159,10 +204,40 @@ def assess(context: ScenarioContext) -> QualityAssessment:
 
     baseline = snapshot.get("lims_value")
     baseline_age = snapshot.get("lims_age_hours")
+    if snapshot.get("lims_missing"):
+        baseline = None
+    # Сера — четвёртый обязательный показатель в той же таблице, что T95, ЦЧ и
+    # плотность: измеренное значение сравнивается с пределом как факт, а не
+    # только его сдвинутый прогноз (ADR-019).
+    sulfur_fresh = baseline is not None and (
+        baseline_age is None or baseline_age <= MAX_BASELINE_AGE_HOURS
+    )
+    spec_indicators["sulfur"] = {
+        "tag": features.TARGET_TAG,
+        "value": baseline,
+        "unit": "мг/кг",
+        "age_hours": baseline_age,
+        "max_age_hours": MAX_BASELINE_AGE_HOURS,
+        "verified": bool(sulfur_fresh),
+        "limit_mg_kg": config.SULFUR_LIMIT_MG_KG,
+        "direction": "max",
+        "margin_mg_kg": None if baseline is None else config.SULFUR_LIMIT_MG_KG - baseline,
+        "detail": (
+            "нет опубликованного анализа на момент выдачи"
+            if baseline is None
+            else f"анализ {features.TARGET_TAG}, возраст {baseline_age:.1f} ч"
+            if sulfur_fresh
+            else f"анализ старше {MAX_BASELINE_AGE_HOURS:g} ч (возраст {baseline_age:.1f} ч)"
+        ),
+    }
+    measured_violations = [
+        {"rule": item.rule, "detail": item.detail, "kind": item.kind}
+        for item in constraints.check_measured_product(spec_indicators, baseline)
+    ]
     # Контроль качества входа — отдельная названная проверка, а не побочный
     # эффект перцентильных полос (ADR-014).
     input_anomaly = anomaly.assess_lab_value(baseline, context.training_stats["lims_value"])
-    if snapshot.get("lims_missing") or baseline is None:
+    if baseline is None:
         refusal = {
             "reason": "нет опубликованного анализа ЛИМС на момент выдачи",
             "rule": "неизвестная сера не считается допустимой (ТЗ, §4)",
@@ -176,6 +251,32 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             assumptions=assumptions,
             input_anomaly=input_anomaly,
             spec_indicators=spec_indicators,
+            measured_violations=measured_violations,
+            refusal=refusal,
+        )
+    if input_anomaly.get("anomalous") and any(
+        flag.get("code") == "nonphysical" for flag in input_anomaly.get("flags", [])
+    ):
+        # Нефизичное измерение (≤ 0 или не число) — не основание для прогноза:
+        # 0.3·(−5) + 0.7·8.6 = 4.5 «мг/кг» с риском low — это не прогноз, а
+        # артефакт формулы (ADR-019).
+        refusal = {
+            "reason": (
+                f"последний анализ ЛИМС нефизичен ({baseline!r} мг/кг): "
+                + "; ".join(flag["detail"] for flag in input_anomaly.get("flags", []))
+            ),
+            "rule": "прогноз на нефизичном измерении не является обоснованным прогнозом (ADR-014)",
+        }
+        return QualityAssessment(
+            issue_time=str(context.issue_time),
+            forecast=[],
+            in_training_range=in_range,
+            training_range=training_range,
+            data_confidence=confidence,
+            assumptions=assumptions,
+            input_anomaly=input_anomaly,
+            spec_indicators=spec_indicators,
+            measured_violations=measured_violations,
             refusal=refusal,
         )
     if baseline_age is not None and baseline_age > MAX_BASELINE_AGE_HOURS:
@@ -195,6 +296,7 @@ def assess(context: ScenarioContext) -> QualityAssessment:
             assumptions=assumptions,
             input_anomaly=input_anomaly,
             spec_indicators=spec_indicators,
+            measured_violations=measured_violations,
             refusal=refusal,
         )
 
@@ -214,6 +316,9 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         # подбирается заново внутри сценария (ADR-012).
         predicted = shrinkage * baseline + (1.0 - shrinkage) * level
         margin = config.SULFUR_LIMIT_MG_KG - predicted
+        # Измеренное нарушение серы перекрывает прогноз: прогноз 9.2 при
+        # анализе 10.5 — не «риск high», а факт нарушения (ADR-019).
+        sulfur_violated = any(item["rule"] == "sulfur" for item in measured_violations)
         forecast.append(
             {
                 "horizon_hours": horizon,
@@ -229,7 +334,9 @@ def assess(context: ScenarioContext) -> QualityAssessment:
                 "backtest_medae_mg_kg": metrics["medae"],
                 "backtest_n": metrics["n"],
                 "margin_in_rmse": margin / metrics["rmse"],
-                "risk_exceed_spec": _risk(margin, metrics["rmse"]),
+                "risk_exceed_spec": (
+                    RISK_MEASURED_VIOLATION if sulfur_violated else _risk(margin, metrics["rmse"])
+                ),
                 "in_training_range": in_range,
                 "evidence_type": metrics["evidence_type"],
             }
@@ -247,4 +354,5 @@ def assess(context: ScenarioContext) -> QualityAssessment:
         assumptions=assumptions,
         input_anomaly=input_anomaly,
         spec_indicators=spec_indicators,
+        measured_violations=measured_violations,
     )

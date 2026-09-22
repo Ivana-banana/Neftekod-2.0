@@ -18,11 +18,9 @@ def _card(context, title: str = "Тестовая карточка") -> str:
     )
     decision = orchestrator.review(
         submission,
-        sources={
-            "quality": quality_assessment.to_dict(),
-            "reliability": reliability_assessment.to_dict(),
-            "snapshot": context.snapshot,
-        },
+        sources=scenarios.independent_sources(
+            context, quality_assessment, reliability_assessment, optimization.BlendingScenario()
+        ),
     )
     return card.recommendation_markdown(
         title, decision, quality_assessment, reliability_assessment, proposal, submission

@@ -81,6 +81,13 @@ def main() -> int:
         telemetry=telemetry,
         telemetry_lags=forecast.DEFAULT_TELEMETRY_LAGS,
     )
+    if report.empty or not report["split"].eq("test").any():
+        log.error(
+            "отчёт backtest пуст или без строк split=test: в %s нет истории серы "
+            "«Гидроочистка.2» — пересоберите build/ командой scripts/prepare_data.py",
+            config.LONG_FORMAT_CSV,
+        )
+        return 1
     config.BUILD_DIR.mkdir(exist_ok=True)
     report.to_csv(config.FORECAST_CSV, index=False, float_format="%.8f")
     config.FORECAST_MD.write_text(_markdown(report), encoding="utf-8")
