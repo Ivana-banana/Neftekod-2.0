@@ -159,6 +159,57 @@ def _check(name: str, passed: bool, detail: str) -> dict:
     return {"check": name, "passed": passed, "detail": detail}
 
 
+def _is_finite_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _type_problems(submission: dict) -> list[str]:
+    """Мусор в типах полей пакета — причина отказа, а не traceback (ADR-019).
+
+    Проверяется форма, не смысл: словари там, где ожидаются словари, числа
+    или None там, где ожидаются числа. Смысл проверяют остальные проверки.
+    """
+    problems: list[str] = []
+    scenario_input = submission.get("input")
+    if not isinstance(scenario_input, dict):
+        return ["input не является словарём"]
+    components = scenario_input.get("components")
+    if not isinstance(components, dict):
+        problems.append("input.components не является словарём")
+    else:
+        for name, item in components.items():
+            if not isinstance(item, dict):
+                problems.append(f"input.components[{name!r}] не является словарём")
+                continue
+            for field in COMPONENT_FIELDS:
+                value = item.get(field)
+                if value is not None and not _is_finite_number(value):
+                    problems.append(f"input.components[{name!r}].{field} не число: {value!r}")
+    for key in ("current_setpoints", "current_blend_fractions"):
+        mapping = scenario_input.get(key)
+        if mapping is not None and not isinstance(mapping, dict):
+            problems.append(f"input.{key} не является словарём")
+        elif isinstance(mapping, dict) and not all(_is_finite_number(v) for v in mapping.values()):
+            problems.append(f"input.{key} содержит нечисловые значения")
+    applied = submission.get("applied_constraints")
+    if not isinstance(applied, dict):
+        problems.append("applied_constraints не является словарём")
+    elif applied.get("allowed_ranges") is not None and not isinstance(applied.get("allowed_ranges"), dict):
+        problems.append("applied_constraints.allowed_ranges не является словарём")
+    recommendation = submission.get("recommendation")
+    if recommendation is not None and not isinstance(recommendation, dict):
+        problems.append("recommendation не является словарём")
+    elif isinstance(recommendation, dict):
+        for key in ("blend_fractions", "setpoints", "allowed_ranges"):
+            value = recommendation.get(key)
+            if value is not None and not isinstance(value, dict):
+                problems.append(f"recommendation.{key} не является словарём")
+        fractions = recommendation.get("blend_fractions")
+        if isinstance(fractions, dict) and not all(_is_finite_number(v) for v in fractions.values()):
+            problems.append("recommendation.blend_fractions содержит нечисловые доли")
+    return problems
+
+
 def _recompute_blend_sulfur(components: dict, fractions: dict) -> tuple[float | None, str]:
     unknown = [name for name in fractions if name not in components]
     if unknown:
@@ -487,6 +538,23 @@ def review(submission: dict, *, sources: dict) -> Decision:
     «Почти допустимо» вердиктом не является.
     """
     _assert_contract(submission, sources)
+    problems = _type_problems(submission)
+    if problems:
+        return Decision(
+            issue_time=str((submission.get("input") or {}).get("issue_time"))
+            if isinstance(submission.get("input"), dict)
+            else "unknown",
+            verdict="rejected",
+            recommendation=None,
+            checks=[_check("package_types", False, "; ".join(problems))],
+            rejection_reasons=[f"пакет содержит поля неверного типа: {'; '.join(problems)}"],
+            explanation=(
+                "Рекомендация отклонена: пакет не разбирается — "
+                + "; ".join(problems)
+                + ". Воспроизвести проверки на таком пакете нельзя."
+            ),
+            received_keys=sorted(submission),
+        )
     issue_time = str(submission["input"].get("issue_time"))
     applied = submission["applied_constraints"]
     recommendation = submission.get("recommendation")
@@ -655,6 +723,10 @@ def review(submission: dict, *, sources: dict) -> Decision:
 
     claimed = recommendation.get("predicted_sulfur_mg_kg")
     fractions = recommendation.get("blend_fractions")
+    # Состав с нарушением формы (нечисловые/отрицательные доли, сумма ≠ 1) уже
+    # отклонён выше; пересчитывать смесь по нему бессмысленно.
+    if any(v.rule == "blend_fractions" for v in violations):
+        fractions = None
     if fractions:
         recomputed, detail = _recompute_blend_sulfur(submission["input"].get("components", {}), fractions)
         if recomputed is None:
@@ -739,6 +811,27 @@ def review(submission: dict, *, sources: dict) -> Decision:
     if not is_status_quo:
         for violation in range_violations:
             reasons.append(f"уставка вне применённого диапазона: {violation.detail}")
+
+    # Изменение уставок не сертифицируется по построению: влияние P8/T11/F19 на
+    # T95 и ЦЧ не моделируется, модель эффекта на серу проиграла baseline
+    # (ADR-015, ADR-012). Агент оптимизации отклоняет такие кандидаты сам, а
+    # оркестратор обязан воспроизвести это правило, иначе пакет с
+    # «adjust_setpoint» и числами статус-кво проходил бы (ADR-019).
+    checks.append(
+        _check(
+            "setpoint_change_not_certifiable",
+            unchanged_setpoints,
+            "уставки совпадают с текущими"
+            if unchanged_setpoints
+            else "рекомендация меняет уставки, а их влияние на T95/ЦЧ не моделируется (ADR-015)",
+        )
+    )
+    if not unchanged_setpoints:
+        reasons.append(
+            "рекомендация меняет уставки P8/T11/F19: их влияние на T95 и цетановое число не "
+            "моделируется, а модель эффекта на серу проиграла baseline — изменение уставок "
+            "не сертифицируется (ADR-015)"
+        )
 
     action = recommendation.get("action")
     if action == "hold" and not is_status_quo:

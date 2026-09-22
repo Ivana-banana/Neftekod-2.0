@@ -197,7 +197,8 @@ def execute(
         "агент качества: %s",
         "отказ — " + quality.refusal["reason"]
         if quality.refusal
-        else f"риск {quality.forecast[0]['risk_exceed_spec']}, "
+        # Тот же худший горизонт, что у оптимизатора и оркестратора (ADR-010, §3б).
+        else f"риск {max(quality.forecast, key=lambda item: item['backtest_rmse_mg_kg'])['risk_exceed_spec']}, "
         f"прогноз {quality.forecast[0]['predicted_sulfur_mg_kg']:.4g} мг/кг",
     )
     reliability = reliability_agent.assess(scenario_context)

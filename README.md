@@ -46,7 +46,7 @@ python scripts/evaluate_forecast.py   # backtest прогноза серы → b
 python scripts/run_all_scenarios.py   # 4 сценария → build/scenario_*/recommendation.md + JSON
 
 # 4. Тесты
-pytest -q                             # 336 passed
+pytest -q                             # 346 passed
 ```
 
 Без телеметрии работают `prepare_data.py` и `pytest` (324 passed, 12 skipped);
@@ -72,7 +72,7 @@ data/242000_tags.csv ──── evaluate_forecast.py ── build/forecast_rep
      │                                          модельные диапазоны p05–p95 для оптимизации
      ├─ агент оптимизации   → optimization.json 12 кандидатов (hold, 5 долей блендинга, 6 уставок),
      │                        submission.json   причина отклонения каждого, evidence_type у каждого
-     └─ оркестратор         → decision.json     26 независимых проверок по пакету и источникам,
+     └─ оркестратор         → decision.json     27 независимых проверок по пакету и источникам,
                               recommendation.md вердикт approved / rejected / no_admissible_recommendation
 ```
 
@@ -98,8 +98,9 @@ data/242000_tags.csv ──── evaluate_forecast.py ── build/forecast_rep
   Экономика никогда не делает вариант допустимым.
 - **Оркестратор** сверяет пакет не сам с собой, а с выводами агентов качества и
   надёжности, снимком данных, показателями компонента, разрешёнными из данных
-  отдельно, и постановкой блендинга (ADR-010, ADR-019); подделка любого поля
-  пакета даёт `rejected`.
+  отдельно, и постановкой блендинга (ADR-010, ADR-019); подмена чисел, состава,
+  диапазонов, пределов, подписи `evidence_type` или изменение уставок в пакете
+  даёт `rejected`.
 
 Все решения с обоснованием — в `docs/adr/` (ADR = architecture decision
 record; свежие уточнения в начале файла имеют приоритет).
@@ -121,7 +122,7 @@ record; свежие уточнения в начале файла имеют п
 | 1 `stable` — самая спокойная неделя test | нет лишних действий | `hold`; плотность продукта не подтверждена (анализу 50 ч при пороге 48) → изменения заблокированы, статус-кво с пометкой |
 | 2 `quality_risk` — рост серы 3.2 → 9.9 за 72 ч | риск качества | `hold` с предупреждением: запас 0.26 мг/кг у текущего состава; ЦЧ продукта не подтверждено (61 сут) — изменение состава не сертифицируется |
 | 3 `stale_data` — середина разрыва ЛИМС 350 ч | неполные/устаревшие/аномальные данные | отказ с названной причиной: ЛИМС 179 ч, **ПАК залип 7 суток** (возраст 0 ч, одно число), **установка остановлена** (T11 = 27.7 при ~360) |
-| 4 `full_cycle` — наибольший запас по сере | полный цикл до рекомендации | **`adjust_blend`**: снизить долю модельного прямогонного компонента 0.0074 % → 0; сера смеси 8.37 → 7.67 мг/кг; все четыре показателя подтверждены; 26/26 проверок оркестратора |
+| 4 `full_cycle` — наибольший запас по сере | полный цикл до рекомендации | **`adjust_blend`**: снизить долю модельного прямогонного компонента 0.0074 % → 0; сера смеси 8.37 → 7.67 мг/кг; все четыре показателя подтверждены; 27/27 проверок оркестратора |
 
 Окна и моменты выдачи заморожены до правки моделей (ADR-010, ADR-011) и
 закрыты тестом `tests/test_scenarios.py`.
@@ -141,7 +142,7 @@ Backtest прогноза серы на test (253 анализа, горизон
 ## Как протестировать
 
 ```bash
-pytest -q                                   # весь набор: 336 passed (с телеметрией и build/)
+pytest -q                                   # весь набор: 346 passed (с телеметрией и build/)
 pytest -q tests/test_hard_constraints.py tests/test_spec.py   # жёсткие ограничения отдельно
 pytest -q tests/test_agents.py -k "evidence_type or backtested"  # подпись у каждого вывода
 python scripts/scenario_stable.py --role quality   # одна роль одного сценария (пишет только свой файл)
@@ -204,9 +205,9 @@ CI (`.github/workflows/tests.yml`) прогоняет то же на Python 3.12
 
 | Путь | Назначение |
 |---|---|
-| `src/neftekod/` | пакет: `parse_lims_pak.py`, `features.py`, `splits.py`, `forecast.py`, `constraints.py`, `spec.py`, `anomaly.py`, `telemetry_defects.py`, `scenarios.py`, `agents/{quality,reliability,optimization,orchestrator,card,context}.py` |
+| `src/neftekod/` | пакет: `config.py` (пути, пределы, границы split), `parse_lims_pak.py`, `tag_map.py`, `formula_corrections.py`, `coverage.py`, `telemetry.py`, `telemetry_defects.py`, `features.py`, `splits.py`, `forecast.py`, `anomaly.py`, `constraints.py`, `spec.py`, `scenarios.py`, `agents/{context,quality,reliability,optimization,orchestrator,card,report}.py` |
 | `scripts/` | `prepare_data.py`, `evaluate_forecast.py`, `run_all_scenarios.py`, `scenario_*.py [--role …]`; `explore_scenario_windows.py` — служебный, выбор окон для ADR-011 |
-| `tests/` | 336 тестов; жёсткие ограничения — `test_hard_constraints.py`, `test_spec.py`; утечки — `test_time_split.py`, `test_features.py`; роли и оркестратор — `test_agents.py` |
+| `tests/` | 346 тестов; жёсткие ограничения — `test_hard_constraints.py`, `test_spec.py`; утечки — `test_time_split.py`, `test_features.py`; роли и оркестратор — `test_agents.py` |
 | `docs/adr/` | решения 001–019 с обоснованием |
 | `docs/tz/` | ТЗ, справочник тегов, схемы, ответы организаторов, Q&A |
 | `docs/research/` | разборы ГОСТ, offline policy evaluation, фреймворков агентов, рецептур |
@@ -217,4 +218,4 @@ CI (`.github/workflows/tests.yml`) прогоняет то же на Python 3.12
 Зависимости — `pyproject.toml`: pandas ≥ 2.2, numpy ≥ 1.26, openpyxl, tabulate;
 dev — pytest. Проверено 2026-09-22 на чистом клоне: Python 3.12 и 3.14 с
 pandas 3.0.6 / numpy 2.5.3 и Python 3.12 с pandas 2.2.3 / numpy 1.26.4 —
-все 28 файлов `build/scenario_*/` побайтово одинаковы, 336 passed.
+все 28 файлов `build/scenario_*/` побайтово одинаковы, 346 passed.

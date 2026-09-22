@@ -231,6 +231,20 @@ def assess(context: ScenarioContext) -> ReliabilityAssessment:
         severity_class=_severity_class(severity),
         regime_admissible=severity < ADMISSIBLE_SEVERITY_MAX and not plant_stopped,
         plant_stopped=plant_stopped,
+        # Остановленная установка — не режим, который можно сохранить или
+        # изменить: агент отказывается от оценки, и оптимизация не строится.
+        # Индекс и сигналы при этом сохраняются для карточки (ADR-019).
+        refusal=(
+            {
+                "reason": (
+                    f"установка остановлена: T11 = {context.snapshot['T11_value']:.4g} при "
+                    f"пороге останова {SHUTDOWN_T11_MAX:g} — режима нет, рекомендации по нему невозможны"
+                ),
+                "rule": "оценка тяжести и границы режима для остановленной установки не выдаются (ADR-019)",
+            }
+            if plant_stopped
+            else None
+        ),
         signals=signals,
         risk_factors=risk_factors,
         allowed_ranges=allowed_ranges,

@@ -563,10 +563,14 @@ def propose(
     ]
     status_quo_margin = candidates[0]["objective"]["sulfur_margin_mg_kg"]
 
+    seen_fractions: list[float] = []
     for share in blending.candidate_fractions_of_max:
         fraction = share * max_fraction
         if abs(fraction - current_fraction) <= 1e-12:
             continue  # это статус-кво: он уже представлен кандидатом hold
+        if any(abs(fraction - other) <= 1e-12 for other in seen_fractions):
+            continue  # при max_fraction = 0 все доли совпадают — один кандидат, не пять
+        seen_fractions.append(fraction)
         candidates.append(
             _candidate(
                 identifier=f"blend_{blending.cut_component}_f{share:g}",

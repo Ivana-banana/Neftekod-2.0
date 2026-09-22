@@ -1229,3 +1229,60 @@ class TestSubmissionConsistency:
         decision = orchestrator.review(submission, sources=sources)
         assert decision.verdict == "rejected"
         assert any("оценка риска" in reason for reason in decision.rejection_reasons)
+
+
+class TestOrchestratorAdr019:
+    """Проверки, добавленные финальным ревью ADR-019."""
+
+    def test_setpoint_change_in_package_is_rejected(self, scenario_context):
+        """Оптимизатор отклоняет любой setpoint-кандидат; оркестратор обязан тоже."""
+        submission, sources = _submission(scenario_context)
+        hold = optimization.propose(
+            scenario_context, quality.assess(scenario_context), reliability.assess(scenario_context)
+        ).candidates[0]
+        recommendation = dict(hold["recommendation"])
+        recommendation["action"] = "adjust_setpoint"
+        low, high = recommendation["allowed_ranges"]["P8"]
+        recommendation["setpoints"] = dict(recommendation["setpoints"]) | {
+            "P8": recommendation["setpoints"]["P8"] + 0.02 * (high - low)
+        }
+        submission["recommendation"] = recommendation
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+        assert any("не сертифицируется (ADR-015)" in reason for reason in decision.rejection_reasons)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda s: s["recommendation"].__setitem__("blend_fractions", {"hydrotreated_diesel": "abc"}),
+            lambda s: s["recommendation"].__setitem__("blend_fractions", [1.0, 0.0]),
+            lambda s: s["recommendation"].__setitem__("allowed_ranges", "x"),
+            lambda s: s["input"].__setitem__("components", "x"),
+            lambda s: s["input"].__setitem__("components", {"hydrotreated_diesel": "x"}),
+            lambda s: s["input"].__setitem__("current_setpoints", "x"),
+            lambda s: s["applied_constraints"].__setitem__("allowed_ranges", "x"),
+        ],
+    )
+    def test_garbage_types_in_package_give_rejected_not_traceback(self, scenario_context, mutate):
+        submission, sources = _submission(scenario_context)
+        mutate(submission)
+        decision = orchestrator.review(submission, sources=sources)
+        assert decision.verdict == "rejected"
+
+    def test_stopped_plant_is_a_refusal_not_an_approved_hold(self):
+        context = _context(telemetry=_telemetry({"T11": 10.0}))
+        assessment = reliability.assess(context)
+        assert assessment.plant_stopped
+        assert assessment.refusal is not None
+        assert assessment.severity_index is not None
+        proposal = optimization.propose(context, quality.assess(context), assessment)
+        assert proposal.recommended_id is None
+        assert "остановлена" in proposal.refusal["reason"]
+
+    def test_zero_sulfur_headroom_gives_one_blend_candidate_not_five(self):
+        context = _context(long_format=_long_format(feed_sulfur_percent=0.0005))
+        proposal = optimization.propose(
+            context, quality.assess(context), reliability.assess(context)
+        )
+        blends = [item for item in proposal.candidates if item["kind"] == "blend"]
+        assert len(blends) == 1

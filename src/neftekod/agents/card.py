@@ -362,6 +362,16 @@ def _confidence_block(quality, proposal) -> list[str]:
         for name, item in (quality.spec_indicators or {}).items()
         if isinstance(item, dict) and "verified" in item and not item.get("verified")
     ]
+    # Показатели дешёвого компонента разрешаются агентом оптимизации, но
+    # просрочка у них — тоже просрочка источника (ADR-019).
+    stale += [
+        f"компонент, {name}: {item.get('detail')}"
+        for name, item in (proposal.spec_inputs or {}).items()
+        if isinstance(item, dict) and not item.get("verified")
+    ]
+    blending = proposal.blending_inputs or {}
+    if blending.get("refusal"):
+        stale.append(f"компонент, сера: {blending['refusal'].get('reason')}")
     if stale:
         lines.append("- **Предупреждение о старых или пропущенных данных**: " + "; ".join(stale) + ".")
     else:
@@ -443,34 +453,50 @@ def _explanation_block(decision, proposal) -> list[str]:
 def _summary(decision, quality, reliability, proposal) -> list[str]:
     """Три строки для оператора: ситуация → действие → почему. Числа — из вывода ролей."""
     worst = max(quality.forecast, key=lambda item: item["backtest_rmse_mg_kg"]) if quality.forecast else None
+    hold = next((item for item in proposal.candidates if item["kind"] == "no_action"), None)
+    hold_sulfur = None if hold is None else hold["recommendation"].get("predicted_sulfur_mg_kg")
     if quality.refusal:
         situation = f"нет обоснованного прогноза серы — {quality.refusal['reason']}"
     else:
+        # Сера смеси при текущем (модельном) составе, а не базового компонента:
+        # именно с ней сравнивается предел в блоке «Ожидаемый эффект».
         situation = (
-            f"последний анализ серы {worst['last_published_sulfur_mg_kg']:.4g} мг/кг, прогноз "
-            f"{worst['predicted_sulfur_mg_kg']:.4g} при пределе {config.SULFUR_LIMIT_MG_KG:g}, "
-            f"риск `{worst['risk_exceed_spec']}`"
+            f"последний анализ серы {worst['last_published_sulfur_mg_kg']:.4g} мг/кг; "
+            f"прогноз серы товарного ДТ при текущем составе "
+            f"{hold_sulfur if hold_sulfur is not None else worst['predicted_sulfur_mg_kg']:.4g} "
+            f"при пределе {config.SULFUR_LIMIT_MG_KG:g} (базовый компонент "
+            f"{worst['predicted_sulfur_mg_kg']:.4g}), риск `{worst['risk_exceed_spec']}`"
         )
     if getattr(reliability, "plant_stopped", False):
         situation += "; установка остановлена"
     elif reliability.severity_index is not None:
         situation += f"; режим {'допустим' if reliability.regime_admissible else 'недопустим'} (тяжесть {reliability.severity_index:.2g})"
     recommendation = decision.recommendation
+    admissible_changes = [
+        item for item in proposal.candidates if item["admissible"] and item["kind"] != "no_action"
+    ]
     if recommendation is None:
         action = f"действий нет — вердикт `{decision.verdict}`"
         why = decision.rejection_reasons[0] if decision.rejection_reasons else decision.explanation
     elif recommendation.get("action") == "hold":
-        action = "сохранить текущий режим и состав"
-        why = "ни одно изменение не прошло проверки; статус-кво допустим"
+        action = "сохранить текущий режим и состав (состав модельный, ADR-004)"
+        if admissible_changes:
+            why = (
+                f"допустимы также {', '.join(item['id'] for item in admissible_changes)}, но при "
+                "риске moderate/low решает стоимостный прокси, и статус-кво дешевле"
+            )
+        else:
+            why = "ни одно изменение не прошло проверки; статус-кво допустим"
         if recommendation.get("unverified_spec_indicators"):
             why += f" с пометкой «не подтверждено»: {', '.join(recommendation['unverified_spec_indicators'])}"
     else:
         chosen = proposal.recommended() or {}
-        action = chosen.get("description", recommendation.get("action"))
+        action = f"{chosen.get('description', recommendation.get('action'))} (состав модельный, ADR-004)"
+        margin = chosen.get("objective", {}).get("sulfur_margin_mg_kg", float("nan"))
         why = (
-            f"среди допустимых вариантов выбран наибольший запас по сере "
-            f"({chosen.get('objective', {}).get('sulfur_margin_mg_kg', float('nan')):.3g} мг/кг): "
-            "качество приоритетнее экономики (ADR-019)"
+            f"среди допустимых вариантов выбран наибольший запас по сере ({margin:.3g} мг/кг"
+            + (f" против {config.SULFUR_LIMIT_MG_KG - hold_sulfur:.3g} у статус-кво" if hold_sulfur is not None else "")
+            + "): качество приоритетнее экономики (ADR-019)"
         )
     return [
         "**Коротко**",
