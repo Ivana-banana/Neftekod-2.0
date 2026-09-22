@@ -49,7 +49,7 @@ python scripts/run_all_scenarios.py   # 4 сценария → build/scenario_*/
 pytest -q                             # 346 passed
 ```
 
-Без телеметрии работают `prepare_data.py` и `pytest` (324 passed, 12 skipped);
+Без телеметрии работают `prepare_data.py` и `pytest` (334 passed, 12 skipped);
 `evaluate_forecast.py` и `run_all_scenarios.py` завершаются с кодом 1 и
 называют недостающий файл.
 
